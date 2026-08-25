@@ -8,7 +8,7 @@
 |---|---|
 | 내부 API 인증 | Backend -> ai-engine 호출 시 `X-Internal-Token` 누락/오류 요청이 거부되는지 확인한다. |
 | Content-Type | `Content-Type: application/json` 요청만 정상 처리되는지 확인한다. |
-| Swagger 노출 | 활성 엔드포인트가 `http://127.0.0.1:8000/docs`에 노출되고, deprecated/비활성 엔드포인트는 문서 정책과 일치하는지 확인한다. |
+| Swagger 노출 | 활성 엔드포인트가 `http://127.0.0.1:8002/docs`에 노출되고, deprecated/비활성 엔드포인트는 문서 정책과 일치하는지 확인한다. |
 | Frontend 직접 호출 차단 | frontend가 ai-engine을 직접 호출하지 않고 Spring Boot WAS API만 호출하는 흐름인지 확인한다. |
 | 모델명 은닉 | 클라이언트 또는 WAS 요청이 provider 실제 모델명/OpenAI API key/Google 모델명을 직접 다루지 않는지 확인한다. |
 

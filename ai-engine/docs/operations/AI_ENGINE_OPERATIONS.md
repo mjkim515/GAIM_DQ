@@ -6,7 +6,7 @@
 
 | 구성 요소 | 역할 | 기본 포트/주소 |
 | --- | --- | --- |
-| FastAPI API | 텍스트/이미지/비디오 생성 API 제공 | `http://127.0.0.1:8000` |
+| FastAPI API | 텍스트/이미지/비디오 생성 API 제공 | `http://127.0.0.1:8002` |
 | Redis | Celery broker/result backend | `redis://localhost:6379` |
 | Celery worker | 이미지/비디오 비동기 작업 처리 | `image-queue`, `video-queue` |
 | Local storage | 생성 결과 파일 저장 및 `/generated` 정적 서빙 | `storage-data` |
@@ -70,7 +70,7 @@ cp .env.example .env
 
 ```env
 APP_ENV=production
-APP_PORT=8000
+APP_PORT=8002
 SECRET_KEY=replace-with-random-secret
 ALLOWED_ORIGINS=["https://your-frontend.example.com"]
 
@@ -114,14 +114,14 @@ cd /Users/mjkim/project/G-AIM/GAIM_Org/ai-engine
 기본값:
 
 - `HOST=127.0.0.1`
-- `PORT=8000`
+- `PORT=8002`
 - `APP_MODULE=app.main:app`
 - `UVICORN_BIN=.venv/bin/uvicorn`
 
 포트나 host를 바꾸려면 환경변수를 함께 넘긴다.
 
 ```bash
-HOST=0.0.0.0 PORT=8000 ./run_server.sh
+HOST=0.0.0.0 PORT=8002 ./run_server.sh
 ```
 
 `run_server.sh`는 같은 포트에서 이미 실행 중인 프로세스가 있으면 먼저 종료한 뒤 서버를 시작한다.
@@ -145,7 +145,7 @@ cd /Users/mjkim/project/G-AIM/GAIM_Org/ai-engine
 
 ```bash
 HOST=127.0.0.1
-PORT=8000
+PORT=8002
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6379
 REDIS_URL=redis://127.0.0.1:6379/0
@@ -157,7 +157,7 @@ CELERY_WORKER_CONCURRENCY=3
 운영과 유사하게 외부 접속을 허용하려면 다음처럼 실행한다.
 
 ```bash
-HOST=0.0.0.0 PORT=8000 CELERY_WORKER_CONCURRENCY=3 ./run_async_stack.sh
+HOST=0.0.0.0 PORT=8002 CELERY_WORKER_CONCURRENCY=3 ./run_async_stack.sh
 ```
 
 종료:
@@ -235,7 +235,7 @@ docker compose -f docker-compose.prod.yml down
 헬스체크:
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8002/health
 ```
 
 정상 응답 예:
@@ -251,8 +251,8 @@ curl http://127.0.0.1:8000/health
 
 API 문서:
 
-- Swagger: `http://127.0.0.1:8000/docs`
-- ReDoc: `http://127.0.0.1:8000/redoc`
+- Swagger: `http://127.0.0.1:8002/docs`
+- ReDoc: `http://127.0.0.1:8002/redoc`
 
 정적 파일 서빙:
 
@@ -273,7 +273,7 @@ WAS_INTERNAL_TOKEN=change-this-internal-token
 
 Backend 설정:
 
-- AI Engine base URL이 `http://localhost:8000` 또는 운영 AI Engine URL을 가리키는지 확인한다.
+- AI Engine base URL이 `http://localhost:8002` 또는 운영 AI Engine URL을 가리키는지 확인한다.
 - AI Engine과 backend가 같은 `WAS_INTERNAL_TOKEN`을 사용하는지 확인한다.
 - 이미지/비디오 비동기 작업 callback URL이 backend에서 수신 가능한지 확인한다.
 
@@ -309,7 +309,7 @@ cd /Users/mjkim/project/G-AIM/GAIM_Org/ai-engine
 - `STORAGE_PUBLIC_BASE_URL`이 외부에서 접근 가능한 URL이다.
 - API 서버 `/health`가 정상 응답한다.
 - worker 로그에 queue consume 오류가 없다.
-- 방화벽 또는 reverse proxy에서 `8000` 또는 운영 API 포트가 열려 있다.
+- 방화벽 또는 reverse proxy에서 `8002` 또는 운영 API 포트가 열려 있다.
 
 권장 운영 프로세스:
 
@@ -379,7 +379,7 @@ docker ps
 `run_server.sh`와 `stop_async_stack.sh`는 `PORT`에 해당하는 listener를 종료한다. 수동 확인:
 
 ```bash
-lsof -iTCP:8000 -sTCP:LISTEN
+lsof -iTCP:8002 -sTCP:LISTEN
 ```
 
 다른 포트를 사용하려면:
@@ -432,7 +432,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ./run_async_stack.sh
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8002/health
 ```
 
 운영 Docker:
@@ -442,5 +442,5 @@ cd /Users/mjkim/project/G-AIM/GAIM_Org/ai-engine
 cp .env.example .env
 # Edit .env with production values.
 docker compose -f docker-compose.prod.yml up --build -d
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8002/health
 ```
