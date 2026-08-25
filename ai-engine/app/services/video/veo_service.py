@@ -1,0 +1,564 @@
+import asyncio
+import base64
+import binascii
+import logging
+import re
+import time
+
+from app.config import get_settings
+from app.core.exceptions import AIEngineError, RequestValidationError
+from app.core.provider_errors import classify_google_exception, provider_warning_message, public_job_error_message
+from app.schemas.common import JobStatus
+from app.schemas.video import (
+    ResolvedVideoShortRequest,
+    VideoJobResponse,
+    VideoRequest,
+    VideoShortCreateRequest,
+    VideoShortMediaInput,
+    VideoStatusResponse,
+)
+from app.services.callbacks import notify_job_completed, notify_job_failed, notify_job_progress
+from app.services.image.google_service import build_google_video_client
+from app.services.text.prompts import append_visual_safety_guardrails
+from app.services.video.model_router import (
+    build_video_short_candidates,
+    deserialize_video_candidates,
+    serialize_video_candidates,
+)
+from app.services.video.runway_service import generate_runway_video_short_sync
+from app.services.video.storage import store_video
+
+_JOBS: dict[str, VideoStatusResponse] = {}
+DEPRECATED_VEO_MODELS = {
+    "veo-2.0-generate-001",
+    "veo-3.0-generate-001",
+    "veo-3.0-fast-generate-001",
+}
+VIDEO_SHORT_PLATFORM_LABELS = {
+    "youtube_shorts": "YouTube Shorts",
+    "instagram_reels": "Instagram Reels",
+    "tiktok": "TikTok",
+    "naver_clip": "Naver Clip",
+}
+
+logger = logging.getLogger(__name__)
+
+
+def _is_mp4_bytes(data: bytes) -> bool:
+    return len(data) > 12 and data[4:8] == b"ftyp"
+
+
+async def _store_generated_video(data: bytes) -> str:
+    if not _is_mp4_bytes(data):
+        raise RuntimeError("Generated video bytes are not a playable MP4")
+    return await store_video(data)
+
+
+def _set_mock_video_status(job_id: str) -> None:
+    message = "Mock video generation does not create playable MP4. Set AI_PROVIDER_MODE=live to generate video."
+    _JOBS[job_id] = VideoStatusResponse(
+        job_id=job_id,
+        status=JobStatus.failed,
+        error=message,
+        progress_pct=100,
+    )
+    asyncio.create_task(notify_job_failed(job_id, message))
+
+
+async def _set_mock_video_status_async(job_id: str, started_at: float | None = None) -> None:
+    message = "Mock video generation does not create playable MP4. Set AI_PROVIDER_MODE=live to generate video."
+    _JOBS[job_id] = VideoStatusResponse(
+        job_id=job_id,
+        status=JobStatus.failed,
+        error=message,
+        progress_pct=100,
+    )
+    await notify_job_failed(job_id, message, _elapsed_ms(started_at) if started_at is not None else None)
+
+
+async def enqueue_video_generation(request: VideoRequest) -> VideoJobResponse:
+    provider_model = resolve_video_provider_model(request.model)
+    validate_google_video_model(provider_model)
+    request = request.model_copy(update={"model": provider_model})
+    job_id = request.job_id
+    existing_job = _JOBS.get(job_id)
+    if existing_job is not None:
+        return VideoJobResponse(
+            job_id=job_id,
+            status=existing_job.status,
+            message="이미 등록된 jobId입니다. 기존 영상 생성 작업을 반환합니다.",
+        )
+    _JOBS[job_id] = VideoStatusResponse(
+        job_id=job_id,
+        status=JobStatus.queued,
+        progress_pct=0,
+    )
+    from app.workers.tasks.video_tasks import generate_video_task
+
+    generate_video_task.apply_async(args=[request.model_dump(by_alias=True)], queue="video-queue")
+    return VideoJobResponse(
+        job_id=job_id,
+        status=JobStatus.queued,
+        message=f"영상 생성이 시작되었습니다. duration_seconds={request.duration_seconds}",
+    )
+
+
+async def enqueue_video_short_generation(request: VideoShortCreateRequest) -> VideoJobResponse:
+    resolved_request = resolve_video_short_request(request)
+    job_id = request.job_id
+    existing_job = _JOBS.get(job_id)
+    if existing_job is not None:
+        return VideoJobResponse(
+            job_id=job_id,
+            status=existing_job.status,
+            message="이미 등록된 jobId입니다. 기존 영상 생성 작업을 반환합니다.",
+        )
+    _JOBS[job_id] = VideoStatusResponse(
+        job_id=job_id,
+        status=JobStatus.queued,
+        progress_pct=0,
+    )
+    from app.workers.tasks.video_tasks import generate_video_short_task
+
+    generate_video_short_task.apply_async(args=[request.model_dump(by_alias=True)], queue="video-queue")
+    return VideoJobResponse(
+        job_id=job_id,
+        status=JobStatus.queued,
+        message=f"숏폼 영상 생성이 시작되었습니다. task={resolved_request.task}",
+    )
+
+
+async def get_video_status(job_id: str) -> VideoStatusResponse:
+    return _JOBS.get(
+        job_id,
+        VideoStatusResponse(
+            job_id=job_id,
+            status=JobStatus.failed,
+            error="Unknown job_id",
+        ),
+    )
+
+
+async def _run_live_video_short_generation(job_id: str, request: ResolvedVideoShortRequest) -> None:
+    started_at = time.monotonic()
+    if not get_settings().is_live_ai_enabled:
+        await _set_mock_video_status_async(job_id, started_at)
+        return
+    try:
+        _JOBS[job_id] = VideoStatusResponse(job_id=job_id, status=JobStatus.processing, progress_pct=5)
+        await notify_job_progress(job_id, 5)
+        video_bytes, provider, model_used, fallback_used, warnings = await asyncio.to_thread(
+            _generate_video_short_with_fallback_sync,
+            request,
+        )
+        _JOBS[job_id] = VideoStatusResponse(job_id=job_id, status=JobStatus.processing, progress_pct=90)
+        await notify_job_progress(job_id, 90)
+        video_url = await _store_generated_video(video_bytes)
+        _JOBS[job_id] = VideoStatusResponse(
+            job_id=job_id,
+            status=JobStatus.completed,
+            video_url=video_url,
+            progress_pct=100,
+            provider=provider,
+            model_used=model_used,
+            fallback_used=fallback_used,
+            warnings=warnings,
+        )
+        await notify_job_completed(
+            job_id,
+            video_url,
+            _elapsed_ms(started_at),
+            provider=provider,
+            model_used=model_used,
+            fallback_used=fallback_used,
+            warnings=warnings,
+        )
+    except Exception as exc:
+        public_error = public_job_error_message(_normalize_video_provider_exception(exc))
+        logger.exception("Video short job failed job_id=%s model=%s", job_id, request.provider_model)
+        _JOBS[job_id] = VideoStatusResponse(
+            job_id=job_id,
+            status=JobStatus.failed,
+            error=public_error,
+            progress_pct=100,
+        )
+        await notify_job_failed(job_id, public_error, _elapsed_ms(started_at))
+
+
+async def _run_live_video_generation(job_id: str, request: VideoRequest) -> None:
+    started_at = time.monotonic()
+    if not get_settings().is_live_ai_enabled:
+        await _set_mock_video_status_async(job_id, started_at)
+        return
+    try:
+        _JOBS[job_id] = VideoStatusResponse(job_id=job_id, status=JobStatus.processing, progress_pct=5)
+        await notify_job_progress(job_id, 5)
+        video_bytes = await asyncio.to_thread(_generate_veo_video_sync, request)
+        _JOBS[job_id] = VideoStatusResponse(job_id=job_id, status=JobStatus.processing, progress_pct=90)
+        await notify_job_progress(job_id, 90)
+        video_url = await _store_generated_video(video_bytes)
+        _JOBS[job_id] = VideoStatusResponse(
+            job_id=job_id,
+            status=JobStatus.completed,
+            video_url=video_url,
+            progress_pct=100,
+        )
+        await notify_job_completed(job_id, video_url, _elapsed_ms(started_at))
+    except Exception as exc:
+        public_error = public_job_error_message(_normalize_video_provider_exception(exc))
+        logger.exception("Video job failed job_id=%s model=%s", job_id, request.model)
+        _JOBS[job_id] = VideoStatusResponse(
+            job_id=job_id,
+            status=JobStatus.failed,
+            error=public_error,
+            progress_pct=100,
+        )
+        await notify_job_failed(job_id, public_error, _elapsed_ms(started_at))
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
+def _normalize_video_provider_exception(exc: Exception) -> Exception:
+    if isinstance(exc, AIEngineError):
+        return exc
+    return classify_google_exception(exc)
+
+
+def resolve_video_short_request(request: VideoShortCreateRequest) -> ResolvedVideoShortRequest:
+    advanced = request.advanced
+    settings = get_settings()
+    effective_duration_seconds = 8 if request.inferred_task == "referenceToVideo" else request.duration_seconds
+    candidates = build_video_short_candidates(request.model, request.inferred_task, settings, request.provider_override)
+    primary = candidates[0]
+    if primary.provider == "google":
+        validate_google_video_model(primary.model, settings)
+    final_prompt = _build_video_short_prompt_fields(
+        prompt=request.prompt,
+        platform=request.platform,
+        aspect_ratio=request.aspect_ratio,
+        duration_seconds=effective_duration_seconds,
+        task=request.inferred_task,
+        has_start_frame=bool(request.input and request.input.image),
+        has_last_frame=bool(request.input and request.input.last_frame),
+        has_reference_images=bool(request.input and request.input.reference_images),
+        metadata=request.metadata,
+    )
+    return ResolvedVideoShortRequest(
+        provider_model=primary.model,
+        provider=primary.provider,
+        provider_candidates=serialize_video_candidates(candidates),
+        prompt=request.prompt,
+        final_prompt=final_prompt,
+        task=request.inferred_task,
+        platform=request.platform,
+        aspect_ratio=request.aspect_ratio,
+        duration_seconds=effective_duration_seconds,
+        input=request.input,
+        sample_count=advanced.sample_count if advanced and advanced.sample_count is not None else 1,
+        resolution=advanced.resolution if advanced and advanced.resolution is not None else "720p",
+        enhance_prompt=advanced.enhance_prompt if advanced and advanced.enhance_prompt is not None else True,
+        generate_audio=advanced.generate_audio if advanced and advanced.generate_audio is not None else True,
+        compression_quality=(
+            advanced.compression_quality if advanced and advanced.compression_quality is not None else "optimized"
+        ),
+        resize_mode=advanced.resize_mode if advanced and advanced.resize_mode is not None else "crop",
+        negative_prompt=advanced.negative_prompt if advanced else None,
+        person_generation=advanced.person_generation if advanced else None,
+        seed=advanced.seed if advanced else None,
+        storage_uri=advanced.storage_uri if advanced else None,
+        pubsub_topic=advanced.pubsub_topic if advanced else None,
+        metadata=request.metadata,
+    )
+
+
+def resolve_video_provider_model(model: str, settings=None) -> str:
+    settings = settings or get_settings()
+    return {
+        "standard": settings.google_standard_video_model,
+        "fast": settings.google_fast_video_model,
+        "lite": settings.google_lite_video_model,
+    }.get(model, model)
+
+
+def validate_google_video_model(model: str, settings=None) -> None:
+    settings = settings or get_settings()
+    if model in DEPRECATED_VEO_MODELS:
+        raise RequestValidationError(
+            f"Unsupported Google video model: {model}. Veo 3.0 was shut down on 2026-06-30."
+        )
+    if model not in settings.google_video_models:
+        raise RequestValidationError(f"Unsupported Google video model: {model}")
+
+
+def _strip_conflicting_video_prompt_options(prompt: str) -> str:
+    cleaned = prompt.strip()
+    option_patterns = [
+        r"\b(?:YouTube\s+Shorts?|유튜브\s*쇼츠?|쇼츠|Shorts|Instagram\s+Reels?|인스타그램\s*릴스?|릴스|TikTok|틱톡|Naver\s+Clip|네이버\s*클립)\b",
+        r"\b(?:9\s*:\s*16|16\s*:\s*9)\b\s*(?:세로형|가로형|vertical|horizontal)?",
+        r"(?:세로형|가로형)\s*(?:영상|숏폼)?",
+        r"\b(?:vertical|horizontal)\s*(?:format|video)?\b",
+        r"\b(?:[468])\s*(?:초|seconds?|sec)\s*(?:분량|길이|영상)?",
+        r"\b(?:[468])-second\b\s*(?:video|short)?",
+    ]
+    for pattern in option_patterns:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*[,，、]\s*", ", ", cleaned)
+    cleaned = re.sub(r"(?:^\s*[,，、]\s*)|(?:\s*[,，、]\s*$)", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _build_video_short_prompt(request: ResolvedVideoShortRequest) -> str:
+    return request.final_prompt
+
+
+def _build_video_short_prompt_fields(
+    prompt: str,
+    platform: str | None,
+    aspect_ratio: str,
+    duration_seconds: int,
+    task: str = "textToVideo",
+    has_start_frame: bool = False,
+    has_last_frame: bool = False,
+    has_reference_images: bool = False,
+    metadata: dict[str, object] | None = None,
+) -> str:
+    platform_label = VIDEO_SHORT_PLATFORM_LABELS.get(platform or "", "short-form social media")
+    metadata_platform_label = metadata.get("platformLabel") if metadata else None
+    if isinstance(metadata_platform_label, str) and metadata_platform_label.strip():
+        platform_label = metadata_platform_label
+
+    user_scene_prompt = _strip_conflicting_video_prompt_options(prompt)
+    format_instruction = (
+        f"Create a {duration_seconds}-second {platform_label} video in "
+        f"{aspect_ratio} format. Follow these format constraints exactly; "
+        "ignore any conflicting duration, platform, or aspect-ratio wording in the scene description."
+    )
+    visual_direction = _build_video_input_direction(task, has_start_frame, has_last_frame, has_reference_images)
+    if not user_scene_prompt:
+        parts = [format_instruction]
+    else:
+        parts = [format_instruction, f"Scene description:\n{user_scene_prompt}"]
+    if visual_direction:
+        parts.append(visual_direction)
+    return append_visual_safety_guardrails("\n\n".join(parts))
+
+
+def _build_video_input_direction(
+    task: str,
+    has_start_frame: bool,
+    has_last_frame: bool,
+    has_reference_images: bool,
+) -> str | None:
+    if task == "imageToVideo" and has_start_frame and has_last_frame:
+        return (
+            "First and last frame direction:\n"
+            "- Use the provided image as the exact opening frame and the provided lastFrame as the exact ending frame.\n"
+            "- Generate the middle of the video as a coherent transition that strongly follows the scene description.\n"
+            "- Treat the scene description as the primary creative direction for location, subject, action, props, mood, and camera movement.\n"
+            "- Preserve the first and last frames as temporal anchors, but make the intervening motion and visual storytelling reflect the scene description."
+        )
+    if task == "imageToVideo" and has_start_frame:
+        return (
+            "Start frame direction:\n"
+            "- Use the provided image as the exact opening frame.\n"
+            "- Animate outward from that frame while strongly following the scene description for location, subject, action, props, mood, and camera movement."
+        )
+    if task == "referenceToVideo" and has_reference_images:
+        return (
+            "Reference image direction:\n"
+            "- Use the reference images as visual guidance for style, composition, color, and subject consistency.\n"
+            "- The scene description remains the primary creative direction for the generated video."
+        )
+    return None
+
+
+def _generate_video_short_with_fallback_sync(request: ResolvedVideoShortRequest) -> tuple[bytes, str, str, bool, list[str]]:
+    candidates = deserialize_video_candidates(request.provider_candidates)
+    if not candidates:
+        candidates = [type("_Candidate", (), {"rank": 1, "provider": request.provider, "model": request.provider_model})()]
+    warnings: list[str] = []
+    last_error: Exception | None = None
+    for candidate in candidates:
+        candidate_request = request.model_copy(
+            update={
+                "provider": candidate.provider,
+                "provider_model": candidate.model,
+            }
+        )
+        try:
+            if candidate.provider == "google":
+                video_bytes = _generate_video_short_sync(candidate_request)
+            elif candidate.provider == "runway":
+                video_bytes = generate_runway_video_short_sync(candidate_request, candidate.model)
+            else:
+                raise RequestValidationError(f"Unsupported video provider: {candidate.provider}")
+            return video_bytes, candidate.provider, candidate.model, candidate.rank != 1, warnings
+        except RequestValidationError:
+            raise
+        except Exception as exc:
+            last_error = _normalize_video_provider_exception(exc) if candidate.provider == "google" else exc
+            logger.warning(
+                "Video provider candidate failed rank=%s provider=%s model=%s: %s",
+                candidate.rank,
+                candidate.provider,
+                candidate.model,
+                last_error,
+            )
+            warnings.append(
+                f"Rank {candidate.rank} {candidate.provider}/{candidate.model} failed: {provider_warning_message(last_error)}"
+            )
+    if last_error:
+        raise last_error
+    raise RuntimeError("No video provider candidates were available")
+
+
+def _generate_video_short_sync(request: ResolvedVideoShortRequest) -> bytes:
+    from google.genai import types
+
+    settings = get_settings()
+    validate_google_video_model(request.provider_model, settings)
+
+    client = build_google_video_client(settings, request.provider_model)
+    kwargs = _build_video_short_generate_kwargs(request, types)
+    operation = client.models.generate_videos(**kwargs)
+    if operation is None:
+        raise RuntimeError("Video short generation did not return an operation")
+
+    deadline = time.monotonic() + settings.video_max_wait_sec
+    while not _is_operation_done(operation, "Video short"):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Video short generation timed out")
+        time.sleep(settings.video_poll_interval_sec)
+        operation = client.operations.get(operation)
+        if operation is None:
+            raise RuntimeError("Video short polling returned an empty operation")
+
+    return _extract_generated_video_bytes(operation, "Video short")
+
+
+def _build_video_short_generate_kwargs(request: ResolvedVideoShortRequest, types_module):
+    config_kwargs = {
+        "number_of_videos": request.sample_count,
+        "duration_seconds": request.duration_seconds,
+        "aspect_ratio": request.aspect_ratio,
+        "resolution": request.resolution,
+        "seed": request.seed,
+        "negative_prompt": request.negative_prompt,
+        "person_generation": request.person_generation,
+        "enhance_prompt": request.enhance_prompt,
+        "compression_quality": request.compression_quality,
+        "resize_mode": request.resize_mode,
+        "output_gcs_uri": request.storage_uri,
+        "pubsub_topic": request.pubsub_topic,
+    }
+    if request.generate_audio is False:
+        config_kwargs["generate_audio"] = False
+    if request.input and request.input.last_frame:
+        config_kwargs["last_frame"] = _to_google_image(request.input.last_frame, types_module)
+    if request.input and request.input.reference_images:
+        config_kwargs["reference_images"] = [
+            types_module.VideoGenerationReferenceImage(
+                image=_to_google_image(reference, types_module),
+                reference_type="asset",
+            )
+            for reference in request.input.reference_images
+        ]
+
+    kwargs = {
+        "model": request.provider_model,
+        "prompt": _build_video_short_prompt(request),
+        "config": types_module.GenerateVideosConfig(
+            **{key: value for key, value in config_kwargs.items() if value is not None}
+        ),
+    }
+    if request.input and request.input.image:
+        kwargs["image"] = _to_google_image(request.input.image, types_module)
+    return kwargs
+
+
+def _to_google_image(media: VideoShortMediaInput, types_module):
+    if media is None:
+        raise RequestValidationError("Video short media input is required")
+    if media.gcs_uri:
+        return types_module.Image(gcs_uri=media.gcs_uri, mime_type=media.mime_type)
+    if not media.bytes_base64_encoded:
+        raise RequestValidationError("Video short media input requires bytesBase64Encoded when gcsUri is omitted")
+    try:
+        image_bytes = base64.b64decode(media.bytes_base64_encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RequestValidationError("Video short media bytesBase64Encoded is not valid base64") from exc
+    return types_module.Image(
+        image_bytes=image_bytes,
+        mime_type=media.mime_type,
+    )
+
+
+def _generate_veo_video_sync(request: VideoRequest) -> bytes:
+    from google.genai import types
+
+    settings = get_settings()
+    validate_google_video_model(request.model, settings)
+
+    client = build_google_video_client(settings, request.model)
+    operation = client.models.generate_videos(
+        model=request.model,
+        prompt=append_visual_safety_guardrails(request.prompt),
+        config=types.GenerateVideosConfig(
+            number_of_videos=1,
+            duration_seconds=request.duration_seconds,
+            aspect_ratio=request.aspect_ratio,
+        ),
+    )
+    if operation is None:
+        raise RuntimeError("Veo video generation did not return an operation")
+
+    deadline = time.monotonic() + settings.video_max_wait_sec
+    while not _is_operation_done(operation, "Veo"):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Veo video generation timed out")
+        time.sleep(settings.video_poll_interval_sec)
+        operation = client.operations.get(operation)
+        if operation is None:
+            raise RuntimeError("Veo polling returned an empty operation")
+
+    return _extract_generated_video_bytes(operation, "Veo")
+
+
+def _is_operation_done(operation, label: str) -> bool:
+    done = getattr(operation, "done", None)
+    if done is None:
+        return False
+    return bool(done)
+
+
+def _extract_generated_video_bytes(operation, label: str) -> bytes:
+    error = getattr(operation, "error", None)
+    if error:
+        raise RuntimeError(f"{label} operation failed: {error}")
+
+    response = getattr(operation, "response", None) or getattr(operation, "result", None)
+    if response is None:
+        raise RuntimeError(f"{label} operation did not include a response")
+    generated_videos = getattr(response, "generated_videos", None) or []
+    if not generated_videos:
+        raise RuntimeError(f"{label} response did not include generated videos")
+
+    first_generated_video = generated_videos[0]
+    if first_generated_video is None:
+        raise RuntimeError(f"{label} response included an empty generated video")
+
+    video = getattr(first_generated_video, "video", None)
+    if video is None:
+        raise RuntimeError(f"{label} generated video did not include video data")
+
+    video_bytes = getattr(video, "video_bytes", None)
+    if video_bytes:
+        return video_bytes
+
+    video_uri = getattr(video, "uri", None)
+    if video_uri:
+        raise RuntimeError(f"{label} returned a URI instead of bytes: {video_uri}")
+    raise RuntimeError(f"{label} generated video had no bytes")
