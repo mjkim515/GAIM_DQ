@@ -1,10 +1,10 @@
-import base64
 import json
 import time
 from urllib import error, request
 
 from app.config import get_settings
 from app.core.exceptions import ProviderAuthenticationError, ProviderRequestError
+from app.core.media_limits import decode_limited_base64
 from app.core.provider_errors import classify_runway_exception
 from app.schemas.video import ResolvedVideoShortRequest, VideoShortMediaInput
 
@@ -94,7 +94,11 @@ def _to_runway_prompt_image(media: VideoShortMediaInput) -> str:
     if not media.bytes_base64_encoded:
         raise ProviderRequestError("Runway fallback image input is missing bytesBase64Encoded.")
     try:
-        base64.b64decode(media.bytes_base64_encoded, validate=True)
+        decode_limited_base64(
+            media.bytes_base64_encoded,
+            max_bytes=get_settings().max_video_input_image_bytes,
+            label="Runway fallback image input",
+        )
     except ValueError as exc:
         raise ProviderRequestError("Runway fallback image input is not valid base64.") from exc
     return f"data:{media.mime_type};base64,{media.bytes_base64_encoded}"
@@ -113,15 +117,16 @@ def _runway_json_request(method: str, url: str, payload: dict[str, object] | Non
         },
     )
     try:
-        with request.urlopen(req, timeout=30) as response:
+        with request.urlopen(req, timeout=settings.runway_request_timeout_sec) as response:
             return json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         raise classify_runway_exception(exc) from exc
 
 
 def _download_runway_output(url: str) -> bytes:
+    settings = get_settings()
     try:
-        with request.urlopen(url, timeout=60) as response:
+        with request.urlopen(url, timeout=settings.runway_download_timeout_sec) as response:
             return response.read()
     except error.URLError as exc:
         raise classify_runway_exception(exc) from exc

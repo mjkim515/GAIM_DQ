@@ -53,10 +53,11 @@ async def generate_openai_images(request: ProviderImageRequest) -> ImageResponse
     if not settings.openai_api_key:
         raise ProviderAuthenticationError("OpenAI provider authentication failed.")
 
+    client = None
     try:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_provider_timeout_sec)
         response = await client.images.generate(
             model=model,
             prompt=append_visual_safety_guardrails(request.prompt),
@@ -69,6 +70,9 @@ async def generate_openai_images(request: ProviderImageRequest) -> ImageResponse
     except Exception as exc:
         logger.exception("OpenAI image generation failed for model=%s", model)
         raise classify_openai_exception(exc) from exc
+    finally:
+        if client is not None:
+            await client.close()
 
     urls: list[str] = []
     for item in response.data:
@@ -89,10 +93,11 @@ async def edit_openai_images(request: ProviderImageGenerateWithReferenceRequest)
     if not settings.openai_api_key:
         raise ProviderAuthenticationError("OpenAI provider authentication failed.")
 
+    client = None
     try:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_provider_timeout_sec)
         image_inputs = []
         for index, reference in enumerate(request.reference_images):
             if reference.file_id:
@@ -115,6 +120,9 @@ async def edit_openai_images(request: ProviderImageGenerateWithReferenceRequest)
     except Exception as exc:
         logger.exception("OpenAI image edit failed for model=%s", model)
         raise classify_openai_exception(exc) from exc
+    finally:
+        if client is not None:
+            await client.close()
 
     urls: list[str] = []
     for item in response.data:

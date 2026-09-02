@@ -1,3 +1,5 @@
+import logging
+import time
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, Query
@@ -12,6 +14,7 @@ from app.schemas.image import (
     ImageIntentResponse,
     ImageJobRequest,
     ImageJobResponse,
+    ImageStatusResponse,
     ImageModelInfo,
     ProviderImageRequest,
     ImageResponse,
@@ -30,13 +33,27 @@ from app.services.image.model_router import (
 from app.services.image.mock_assets import MOCK_PNG
 from app.services.image.openai_service import OPENAI_IMAGE_MODELS, edit_openai_images, generate_openai_images
 from app.services.image.storage import store_image
+from app.services.job_status import celery_result_payload_for_job, remember_job_task
 from app.workers.tasks.image_tasks import generate_image_task
 
 router = APIRouter(dependencies=[Depends(verify_internal_token)])
+logger = logging.getLogger(__name__)
 
 # Requests are idempotent by jobId within the running API process. Use distinct
-# example IDs when a new generation run is intended.
-_IMAGE_JOB_IDS: set[str] = set()
+# example IDs when a new generation run is intended. Entries are kept briefly to
+# prevent accidental duplicate enqueue without growing for the full process life.
+IMAGE_JOB_ID_TTL_SECONDS = 12 * 60 * 60
+_IMAGE_JOB_IDS: dict[str, float] = {}
+
+
+def _cleanup_expired_image_job_ids(now: float | None = None) -> None:
+    now = now or time.time()
+    expired_job_ids = [
+        job_id for job_id, created_at in _IMAGE_JOB_IDS.items()
+        if now - created_at >= IMAGE_JOB_ID_TTL_SECONDS
+    ]
+    for job_id in expired_job_ids:
+        _IMAGE_JOB_IDS.pop(job_id, None)
 
 IMAGE_JOB_REQUEST_EXAMPLES = {
     "promotion_sns": {
@@ -178,24 +195,44 @@ IMAGE_JOB_REQUEST_EXAMPLES = {
 async def enqueue_image_job_endpoint(
     request: Annotated[ImageJobRequest, Body(openapi_examples=IMAGE_JOB_REQUEST_EXAMPLES)],
 ) -> ImageJobResponse:
+    _cleanup_expired_image_job_ids()
     if request.job_id in _IMAGE_JOB_IDS:
+        logger.info("Duplicate image job_id=%s ignored; existing job is still within TTL", request.job_id)
         return ImageJobResponse(
             jobId=request.job_id,
             status="queued",
-            message="이미 등록된 jobId입니다. 기존 이미지 생성 작업을 반환합니다.",
+            message="이미 등록된 jobId입니다. 새 이미지 생성 작업은 큐에 다시 등록하지 않습니다.",
         )
 
-    _IMAGE_JOB_IDS.add(request.job_id)
+    _IMAGE_JOB_IDS[request.job_id] = time.time()
     try:
-        generate_image_task.apply_async(args=[request.model_dump(by_alias=True)], queue="image-queue")
+        result = generate_image_task.apply_async(args=[request.model_dump(by_alias=True)], queue="image-queue")
+        remember_job_task("image", request.job_id, getattr(result, "id", None))
     except Exception:
-        _IMAGE_JOB_IDS.discard(request.job_id)
+        _IMAGE_JOB_IDS.pop(request.job_id, None)
         raise
     return ImageJobResponse(
         jobId=request.job_id,
         status="queued",
         message="이미지 생성 작업이 큐에 등록되었습니다.",
     )
+
+
+@router.get(
+    "/status/{job_id}",
+    response_model=ImageStatusResponse,
+    summary="[개발/레거시] ai-engine 내부 이미지 Job 상태 조회",
+    description=(
+        "개발 및 WAS reconciler fallback 확인용 상태 API입니다. 운영 상태의 source of truth는 WAS이며, "
+        "frontend는 /api/ai/image/async/job/{jobId}를 호출해야 합니다."
+    ),
+    deprecated=True,
+)
+async def get_image_status_endpoint(job_id: str) -> ImageStatusResponse:
+    payload = celery_result_payload_for_job("image", job_id)
+    if payload is None:
+        return ImageStatusResponse(jobId=job_id, status="failed", error="Unknown job_id", progressPct=100)
+    return ImageStatusResponse.model_validate(payload)
 
 
 @router.post(

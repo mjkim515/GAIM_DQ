@@ -1,9 +1,9 @@
-import base64
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from app.config import get_settings
 from app.core.exceptions import ProviderError
+from app.core.media_limits import decode_limited_base64, read_limited_file, read_limited_response
 from app.schemas.image import ReferenceImage
 
 
@@ -20,8 +20,13 @@ def build_edit_prompt(prompt: str, text_to_render: str | None) -> str:
 
 
 def load_reference_image_bytes(reference: ReferenceImage) -> bytes:
+    settings = get_settings()
     if reference.b64_json:
-        return base64.b64decode(reference.b64_json)
+        return decode_limited_base64(
+            reference.b64_json,
+            max_bytes=settings.max_image_reference_bytes,
+            label="Image reference",
+        )
     if reference.image_url:
         return _load_from_url(reference.image_url)
     raise ProviderError("file_id references are only supported by OpenAI edit requests")
@@ -38,7 +43,11 @@ def _load_from_url(image_url: str) -> bytes:
         local_path = settings.storage_base_dir / relative_key
         if not local_path.exists():
             raise ProviderError(f"Local reference image was not found: {relative_key}")
-        return local_path.read_bytes()
+        return read_limited_file(
+            local_path,
+            max_bytes=settings.max_image_reference_bytes,
+            label="Image reference",
+        )
 
     if parsed.hostname in {"localhost", "127.0.0.1"} and public_parsed.path:
         marker = public_parsed.path.rstrip("/") + "/"
@@ -46,7 +55,15 @@ def _load_from_url(image_url: str) -> bytes:
             relative_key = parsed.path.split(marker, 1)[1]
             local_path = settings.storage_base_dir / relative_key
             if local_path.exists():
-                return local_path.read_bytes()
+                return read_limited_file(
+                    local_path,
+                    max_bytes=settings.max_image_reference_bytes,
+                    label="Image reference",
+                )
 
-    with urlopen(image_url, timeout=20) as response:
-        return response.read()
+    with urlopen(image_url, timeout=settings.reference_image_download_timeout_sec) as response:
+        return read_limited_response(
+            response,
+            max_bytes=settings.max_image_reference_bytes,
+            label="Image reference",
+        )

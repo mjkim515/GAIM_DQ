@@ -24,6 +24,7 @@ ai-engine이 실행 중인 서버와 다른 컴퓨터에서 `127.0.0.1:8002` 주
 
 ```bash
 ssh -L 8002:127.0.0.1:8002 USER@SERVER_HOST
+- 외부 컴퓨터 터미널에서: ssh -L 8002:127.0.0.1:8002 dqlab@211.192.116.158
 ```
 
 - `USER`: ai-engine 서버에 SSH로 접속할 사용자명
@@ -64,7 +65,7 @@ Swagger 상단의 Server 값이 `https://ai.idq.co.kr/gaim`인지 확인합니�
 
 ## 3. Swagger에서 요청 헤더 입력
 
-이미지 endpoint를 펼치고 **Try it out**을 누른 다음 `X-Internal-Token` 입력란에 발급받은 내부 토큰을 입력합니다.
+이미지 endpoint를 펼치고 **Try it out**을 누른 다음 `X-Internal-Token` 입력란에 발급받은 내부 토큰(현재 change-this-internal-token)을 입력합니다.
 
 ```http
 X-Internal-Token: {발급받은 내부 토큰}

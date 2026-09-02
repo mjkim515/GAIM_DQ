@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-CMD ["sh", "-c", "celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-3}"]
+CMD ["sh", "-c", "celery -A app.workers.celery_app.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-3} -Q ${CELERY_QUEUES:-image-queue,video-queue} -n ${CELERY_WORKER_NAME:-ai-worker@%h}"]

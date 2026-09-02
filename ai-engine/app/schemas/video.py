@@ -298,3 +298,4 @@ class VideoStatusResponse(BaseModel):
     model_used: str | None = Field(default=None, alias="modelUsed")
     fallback_used: bool | None = Field(default=None, alias="fallbackUsed")
     warnings: list[str] = Field(default_factory=list)
+    duration_ms: int | None = Field(default=None, alias="durationMs")

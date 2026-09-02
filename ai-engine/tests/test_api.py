@@ -210,6 +210,34 @@ def test_shortform_refine_prompt_contains_visual_safety_guardrails():
     assert "[숏폼 영상 재작성 기준]" in prompt
     assert "[GAIM 시각 콘텐츠 안전 정책]" in prompt
     assert "비성적, 비폭력적, 비혐오적" in prompt
+    assert "영상 길이는 API의 구조화 파라미터로 전달" in prompt
+    assert "재작성 프롬프트 본문에 초 단위 길이를 쓰지 마세요" in prompt
+
+
+def test_shortform_refine_normalization_removes_duration_wording():
+    from app.schemas.text import RefineTextRequest
+    from app.services.text.prompts import normalize_refined_content_prompt
+
+    request = RefineTextRequest(
+        model="auto",
+        mode="content_prompt_rewrite",
+        input={"text": "가을 매장 숏폼"},
+        target={
+            "platform": "youtube_shorts",
+            "format": "shortform_video_prompt",
+            "aspectRatio": "9:16",
+            "durationSeconds": 8,
+        },
+    )
+
+    prompt = normalize_refined_content_prompt(
+        request,
+        "YouTube Shorts용 9:16 세로형 숏폼 영상 4초 분량. 가을 낙엽이 흩날리는 로컬 매장 앞 거리",
+    )
+
+    assert prompt.startswith("YouTube Shorts용 9:16 세로형 숏폼 영상.")
+    assert "4초" not in prompt
+    assert "8초" not in prompt
 
 
 def test_gpt_5_text_completion_uses_max_completion_tokens():
@@ -252,17 +280,12 @@ def test_openapi_image_create_schemas_are_listed_before_test_schemas(client):
     response = client.get("/openapi.json")
     assert response.status_code == 200
 
-    schema_names = list(response.json()["components"]["schemas"])
-    assert schema_names[:6] == [
-        "ImageRequest",
-        "ReferenceImage",
-        "ImageCreateResponse",
-        "ImageCreateRouting",
-        "ImageModelCandidate",
-        "ImageResponse",
-    ]
-    assert schema_names.index("ProviderImageRequest") > schema_names.index("ImageResponse")
-    assert schema_names.index("ImageIntentRequest") > schema_names.index("ImageResponse")
+    schema_names = set(response.json()["components"]["schemas"])
+    assert "ImageJobRequest" in schema_names
+    assert "ImageJobResponse" in schema_names
+    assert "ProviderImageRequest" in schema_names
+    assert "ImageIntentRequest" in schema_names
+    assert "ImageCreateResponse" not in schema_names
 
 
 def test_swagger_public_urls_follow_local_and_production_requests():
@@ -328,6 +351,63 @@ def test_video_short_generates_mock_job_with_camel_case_body(client, auth_header
     assert "Mock video generation does not create playable MP4" in status_data["error"]
 
 
+def test_image_status_endpoint_reads_celery_result_payload(client, auth_headers, monkeypatch):
+    from app.api.v1 import image as image_api
+
+    monkeypatch.setattr(image_api, "celery_result_payload_for_job", lambda job_type, job_id: {
+        "jobId": job_id,
+        "status": "completed",
+        "images": ["http://testserver/generated/images/result.png"],
+        "provider": "google",
+        "modelUsed": "gemini-2.5-flash-image",
+        "durationMs": 1234,
+        "progressPct": 100,
+    })
+
+    response = client.get("/v1/image/status/reconciler-image-job", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["jobId"] == "reconciler-image-job"
+    assert data["status"] == "completed"
+    assert data["images"] == ["http://testserver/generated/images/result.png"]
+    assert data["provider"] == "google"
+    assert data["modelUsed"] == "gemini-2.5-flash-image"
+    assert data["durationMs"] == 1234
+    assert data["progressPct"] == 100
+
+
+def test_video_status_endpoint_falls_back_to_celery_result_payload(client, auth_headers, monkeypatch):
+    from app.services.video import veo_service
+
+    job_id = "reconciler-video-job"
+    veo_service._JOBS.pop(job_id, None)
+    veo_service._JOB_UPDATED_AT.pop(job_id, None)
+    monkeypatch.setattr(veo_service, "celery_result_payload_for_job", lambda job_type, current_job_id: {
+        "jobId": current_job_id,
+        "status": "completed",
+        "videoUrl": "http://testserver/generated/videos/result.mp4",
+        "provider": "google",
+        "modelUsed": "veo-3.1-fast-generate-001",
+        "fallbackUsed": False,
+        "warnings": [],
+        "durationMs": 2345,
+        "progressPct": 100,
+    })
+
+    response = client.get(f"/v1/video/status/{job_id}", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["jobId"] == job_id
+    assert data["status"] == "completed"
+    assert data["videoUrl"] == "http://testserver/generated/videos/result.mp4"
+    assert data["provider"] == "google"
+    assert data["modelUsed"] == "veo-3.1-fast-generate-001"
+    assert data["durationMs"] == 2345
+    assert data["progressPct"] == 100
+
+
 def test_video_short_duplicate_job_id_is_not_enqueued_twice(monkeypatch):
     import asyncio
 
@@ -337,6 +417,7 @@ def test_video_short_duplicate_job_id_is_not_enqueued_twice(monkeypatch):
 
     job_id = "duplicate-video-job"
     veo_service._JOBS.pop(job_id, None)
+    veo_service._JOB_UPDATED_AT.pop(job_id, None)
     enqueued_requests = []
 
     def capture_enqueue(*, args, queue):
@@ -366,6 +447,46 @@ def test_video_short_duplicate_job_id_is_not_enqueued_twice(monkeypatch):
     assert enqueued_requests[0][1] == "video-queue"
 
 
+def test_video_short_expired_job_id_can_be_enqueued_again(monkeypatch):
+    import asyncio
+    import time
+
+    from app.schemas.common import JobStatus
+    from app.schemas.video import VideoShortCreateRequest, VideoStatusResponse
+    from app.services.video import veo_service
+    from app.workers.tasks import video_tasks
+
+    job_id = "expired-video-job"
+    veo_service._JOBS[job_id] = VideoStatusResponse(
+        job_id=job_id,
+        status=JobStatus.queued,
+        progress_pct=0,
+    )
+    veo_service._JOB_UPDATED_AT[job_id] = time.time() - veo_service.VIDEO_JOB_TTL_SECONDS - 1
+    enqueued_requests = []
+
+    def capture_enqueue(*, args, queue):
+        enqueued_requests.append((args, queue))
+
+    monkeypatch.setattr(video_tasks.generate_video_short_task, "apply_async", capture_enqueue)
+    request = VideoShortCreateRequest.model_validate({
+        "jobId": job_id,
+        "prompt": "An expired video job id should enqueue again",
+        "model": "fast",
+        "task": "textToVideo",
+        "aspectRatio": "9:16",
+        "durationSeconds": 4,
+    })
+
+    response = asyncio.run(veo_service.enqueue_video_short_generation(request))
+
+    assert response.status.value == "queued"
+    assert len(enqueued_requests) == 1
+    assert enqueued_requests[0][1] == "video-queue"
+    assert job_id in veo_service._JOBS
+    assert job_id in veo_service._JOB_UPDATED_AT
+
+
 def test_image_duplicate_job_id_is_not_enqueued_twice(monkeypatch):
     import asyncio
 
@@ -373,7 +494,7 @@ def test_image_duplicate_job_id_is_not_enqueued_twice(monkeypatch):
     from app.schemas.image import ImageJobRequest
 
     job_id = "duplicate-image-job"
-    image_api._IMAGE_JOB_IDS.discard(job_id)
+    image_api._IMAGE_JOB_IDS.pop(job_id, None)
     enqueued_requests = []
 
     def capture_enqueue(*, args, queue):
@@ -400,6 +521,37 @@ def test_image_duplicate_job_id_is_not_enqueued_twice(monkeypatch):
     assert "이미 등록된 jobId" in second.message
     assert len(enqueued_requests) == 1
     assert enqueued_requests[0][1] == "image-queue"
+
+
+def test_image_expired_job_id_can_be_enqueued_again(monkeypatch):
+    import asyncio
+    import time
+
+    from app.api.v1 import image as image_api
+    from app.schemas.image import ImageJobRequest
+
+    job_id = "expired-image-job"
+    image_api._IMAGE_JOB_IDS[job_id] = time.time() - image_api.IMAGE_JOB_ID_TTL_SECONDS - 1
+    enqueued_requests = []
+
+    def capture_enqueue(*, args, queue):
+        enqueued_requests.append((args, queue))
+
+    monkeypatch.setattr(image_api.generate_image_task, "apply_async", capture_enqueue)
+    request = ImageJobRequest.model_validate({
+        "jobId": job_id,
+        "purpose": "promotion",
+        "channels": ["instagram"],
+        "image_prompt": "An expired image job id should enqueue again",
+        "n": 1,
+    })
+
+    response = asyncio.run(image_api.enqueue_image_job_endpoint(request))
+
+    assert response.status == "queued"
+    assert len(enqueued_requests) == 1
+    assert enqueued_requests[0][1] == "image-queue"
+    assert job_id in image_api._IMAGE_JOB_IDS
 
 
 def test_video_short_rejects_reference_images_mixed_with_image(client, auth_headers):
@@ -476,6 +628,10 @@ def test_video_short_resolves_defaults_and_google_kwargs_exclude_external_fields
     assert "platform" not in config
     assert "[GAIM 시각 콘텐츠 안전 정책]" in kwargs["prompt"]
     assert "비성적, 비폭력적, 비혐오적" in kwargs["prompt"]
+    assert "[Visible writing policy]" in kwargs["prompt"]
+    assert "render them only as short, common English words" in kwargs["prompt"]
+    assert "Korean writing must not appear" in kwargs["prompt"]
+    assert "8-second" not in kwargs["prompt"]
     assert "First and last frame direction:" in kwargs["prompt"]
     assert "provided image as the exact opening frame" in kwargs["prompt"]
     assert "provided lastFrame as the exact ending frame" in kwargs["prompt"]
@@ -613,6 +769,77 @@ def test_video_short_generation_falls_back_to_runway_when_veo_fails(monkeypatch)
     assert model_used == "gen4.5"
     assert fallback_used is True
     assert "google/veo-3.1-fast-generate-001 failed" in warnings[0]
+
+
+def test_video_short_retryable_primary_error_fails_without_celery_retry(monkeypatch):
+    from app.core.exceptions import ProviderAuthenticationError, ProviderTimeoutError
+    from app.schemas.video import VideoShortCreateRequest
+    from app.services.video import veo_service
+
+    def timeout_google(request):
+        raise ProviderTimeoutError("Google provider request timed out.")
+
+    def fail_runway_auth(request, model):
+        raise ProviderAuthenticationError("Runway provider authentication failed.")
+
+    monkeypatch.setattr(veo_service, "_generate_video_short_sync", timeout_google)
+    monkeypatch.setattr(veo_service, "generate_runway_video_short_sync", fail_runway_auth)
+
+    request = veo_service.resolve_video_short_request(
+        VideoShortCreateRequest(
+            jobId="retry-video-job",
+            prompt="강릉 카페 홍보 영상",
+            model="fast",
+            platform="instagram_reels",
+            task="textToVideo",
+            aspectRatio="9:16",
+            durationSeconds=8,
+        )
+    )
+
+    try:
+        veo_service._generate_video_short_with_fallback_sync(request)
+    except ProviderAuthenticationError:
+        pass
+    else:
+        raise AssertionError("Expected final fallback auth failure when Celery retry is disabled")
+
+
+def test_video_short_retryable_primary_error_survives_fallback_auth_failure_when_retry_enabled(monkeypatch):
+    from app.config import get_settings
+    from app.core.exceptions import ProviderAuthenticationError, ProviderTimeoutError
+    from app.schemas.video import VideoShortCreateRequest
+    from app.services.video import veo_service
+
+    def timeout_google(request):
+        raise ProviderTimeoutError("Google provider request timed out.")
+
+    def fail_runway_auth(request, model):
+        raise ProviderAuthenticationError("Runway provider authentication failed.")
+
+    monkeypatch.setenv("CELERY_TASK_RETRY_ENABLED", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr(veo_service, "_generate_video_short_sync", timeout_google)
+    monkeypatch.setattr(veo_service, "generate_runway_video_short_sync", fail_runway_auth)
+
+    request = veo_service.resolve_video_short_request(
+        VideoShortCreateRequest(
+            jobId="retry-video-job",
+            prompt="강릉 카페 홍보 영상",
+            model="fast",
+            platform="instagram_reels",
+            task="textToVideo",
+            aspectRatio="9:16",
+            durationSeconds=8,
+        )
+    )
+
+    try:
+        veo_service._generate_video_short_with_fallback_sync(request)
+    except ProviderTimeoutError:
+        pass
+    else:
+        raise AssertionError("Expected retryable Google timeout to survive fallback auth failure")
 
 
 def test_video_completed_callback_includes_provider_metadata(monkeypatch):
@@ -860,6 +1087,25 @@ def test_google_vertex_auth_requires_service_account(monkeypatch):
         assert "GCP_SERVICE_ACCOUNT_JSON" not in str(exc)
     else:
         raise AssertionError("Expected ProviderError")
+
+
+def test_production_settings_reject_eager_mode(monkeypatch):
+    import pytest
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("SECRET_KEY", "production-secret")
+    monkeypatch.setenv("WAS_INTERNAL_TOKEN", "production-token")
+    monkeypatch.setenv("WAS_BASE_URL", "https://was.example.com")
+    monkeypatch.setenv("AI_PROVIDER_MODE", "mock")
+    monkeypatch.setenv("CELERY_TASK_ALWAYS_EAGER", "true")
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings()
+
+    assert "CELERY_TASK_ALWAYS_EAGER must be false in production" in str(exc_info.value)
 
 
 def test_image_generate_accepts_gpt_image_2_options(client, auth_headers):
@@ -1167,20 +1413,20 @@ def test_image_intent_rejects_inpaint_without_reference(client, auth_headers):
     assert response.json()["code"] == "REQUEST_VALIDATION_ERROR"
 
 
-def test_image_create_routes_promotion_to_ranked_nano_banana(client, auth_headers):
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-            json={
-                "purpose": "홍보",
-                "channels": ["인스타", "SNS"],
-                "image_prompt": "신선한 과일을 판매하는 밝고 깔끔한 상점 이미지",
-                "visual_mood": "warm_cozy",
-                "n": 3,
-            },
-    )
-    assert response.status_code == 200
-    data = response.json()
+def test_image_create_routes_promotion_to_ranked_nano_banana():
+    import asyncio
+
+    from app.schemas.image import ImageRequest
+    from app.services.image.create_service import create_image
+
+    result = asyncio.run(create_image(ImageRequest.model_validate({
+        "purpose": "홍보",
+        "channels": ["인스타", "SNS"],
+        "image_prompt": "신선한 과일을 판매하는 밝고 깔끔한 상점 이미지",
+        "visual_mood": "warm_cozy",
+        "n": 3,
+    })))
+    data = result.model_dump()
     assert data["provider"] == "google"
     assert data["routing"]["primary_channel"] == "instagram_feed"
     assert data["routing"]["selected"]["model"] == "gemini-2.5-flash-image"
@@ -1201,58 +1447,58 @@ def test_image_create_routes_promotion_to_ranked_nano_banana(client, auth_header
     assert "Create a" not in data["routing"]["final_prompt"]
 
 
-def test_image_create_routes_instagram_story_to_vertical_format(client, auth_headers):
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-        json={
-            "purpose": "홍보",
-            "channels": ["instagram_story"],
-            "image_prompt": "신제품 디저트를 소개하는 세로형 스토리 광고 이미지",
-            "visual_mood": "bright",
-            "n": 1,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
+def test_image_create_routes_instagram_story_to_vertical_format():
+    import asyncio
+
+    from app.schemas.image import ImageRequest
+    from app.services.image.create_service import create_image
+
+    result = asyncio.run(create_image(ImageRequest.model_validate({
+        "purpose": "홍보",
+        "channels": ["instagram_story"],
+        "image_prompt": "신제품 디저트를 소개하는 세로형 스토리 광고 이미지",
+        "visual_mood": "bright",
+        "n": 1,
+    })))
+    data = result.model_dump()
     assert data["routing"]["primary_channel"] == "instagram_story"
     assert data["routing"]["selected"]["size"] == "9:16"
 
 
-def test_image_create_routes_instagram_reels_text_to_openai_vertical_format(client, auth_headers):
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-        json={
-            "purpose": "홍보",
-            "channels": ["instagram_reels"],
-            "image_prompt": "신메뉴 출시를 알리는 릴스 커버 이미지",
-            "text_to_render": "오늘만 신메뉴 20% 할인",
-            "visual_mood": "vibrant",
-            "n": 1,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
+def test_image_create_routes_instagram_reels_text_to_openai_vertical_format():
+    import asyncio
+
+    from app.schemas.image import ImageRequest
+    from app.services.image.create_service import create_image
+
+    result = asyncio.run(create_image(ImageRequest.model_validate({
+        "purpose": "홍보",
+        "channels": ["instagram_reels"],
+        "image_prompt": "신메뉴 출시를 알리는 릴스 커버 이미지",
+        "text_to_render": "오늘만 신메뉴 20% 할인",
+        "visual_mood": "vibrant",
+        "n": 1,
+    })))
+    data = result.model_dump()
     assert data["provider"] == "openai"
     assert data["routing"]["primary_channel"] == "instagram_reels"
     assert data["routing"]["selected"]["size"] == "1024x1536"
 
 
-def test_image_create_routes_brand_to_nano_banana(client, auth_headers):
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-            json={
-                "purpose": "brand",
-                "channels": ["banner", "blog"],
-                "image_prompt": "프리미엄 과일 선물세트를 소개하는 고급스러운 브랜드 이미지",
-                "visual_mood": "premium",
-                "n": 4,
-            },
-    )
-    assert response.status_code == 200
-    data = response.json()
+def test_image_create_routes_brand_to_nano_banana():
+    import asyncio
+
+    from app.schemas.image import ImageRequest
+    from app.services.image.create_service import create_image
+
+    result = asyncio.run(create_image(ImageRequest.model_validate({
+        "purpose": "brand",
+        "channels": ["banner", "blog"],
+        "image_prompt": "프리미엄 과일 선물세트를 소개하는 고급스러운 브랜드 이미지",
+        "visual_mood": "premium",
+        "n": 4,
+    })))
+    data = result.model_dump()
     assert data["routing"]["primary_channel"] == "banner"
     assert data["routing"]["selected"]["model"] == "gemini-2.5-flash-image"
     assert data["routing"]["selected"]["n"] == 4
@@ -1298,79 +1544,79 @@ def test_image_create_promotion_openai_fallback_uses_standard_model():
     assert openai_candidate.operation == "generate"
 
 
-def test_image_create_routes_reference_to_nano_banana(client, auth_headers):
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-            json={
-                "purpose": "이벤트",
-                "channels": ["인스타"],
-                "image_prompt": "참조 이미지를 활용해서 과일 가게 봄맞이 이벤트 이미지로 만들어줘",
-            "reference_images": [
-                {
-                    "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ax7Z3sAAAAASUVORK5CYII=",
-                    "mime_type": "image/png",
-                }
-            ],
-            "visual_mood": "bright",
-            "n": 1,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
+def test_image_create_routes_reference_to_nano_banana():
+    import asyncio
+
+    from app.schemas.image import ImageRequest
+    from app.services.image.create_service import create_image
+
+    result = asyncio.run(create_image(ImageRequest.model_validate({
+        "purpose": "이벤트",
+        "channels": ["인스타"],
+        "image_prompt": "참조 이미지를 활용해서 과일 가게 봄맞이 이벤트 이미지로 만들어줘",
+        "reference_images": [
+            {
+                "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ax7Z3sAAAAASUVORK5CYII=",
+                "mime_type": "image/png",
+            }
+        ],
+        "visual_mood": "bright",
+        "n": 1,
+    })))
+    data = result.model_dump()
     assert data["routing"]["selected"]["model"] == "gemini-2.5-flash-image"
     assert data["routing"]["selected"]["operation"] == "edit"
     assert "[참조 이미지]" in data["routing"]["final_prompt"]
     assert "첨부된 참조 이미지를 상품, 공간, 분위기, 구도의 시각적 가이드로만 사용하세요" in data["routing"]["final_prompt"]
 
 
-def test_image_create_routes_text_to_openai(client, auth_headers):
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-            json={
-                "purpose": "홍보",
-                "channels": ["인스타"],
-                "image_prompt": "과일 가게 할인 행사 홍보 이미지",
-            "text_rendering": {
-                "text": "오늘 딸기 30% 할인",
-                "language": "ko",
-                "placement": "bottom",
-                "must_render_exactly": True,
-            },
-            "visual_mood": "vibrant",
-            "n": 1,
+def test_image_create_routes_text_to_openai():
+    import asyncio
+
+    from app.schemas.image import ImageRequest
+    from app.services.image.create_service import create_image
+
+    result = asyncio.run(create_image(ImageRequest.model_validate({
+        "purpose": "홍보",
+        "channels": ["인스타"],
+        "image_prompt": "과일 가게 할인 행사 홍보 이미지",
+        "text_rendering": {
+            "text": "오늘 딸기 30% 할인",
+            "language": "ko",
+            "placement": "bottom",
+            "must_render_exactly": True,
         },
-    )
-    assert response.status_code == 200
-    data = response.json()
+        "visual_mood": "vibrant",
+        "n": 1,
+    })))
+    data = result.model_dump()
     assert data["provider"] == "openai"
     assert data["routing"]["selected"]["model"] == "gpt-image-2"
     assert data["routing"]["selected"]["operation"] == "generate"
     assert "다음 문구를 이미지 안에 정확히 렌더링하세요" in data["routing"]["final_prompt"]
 
 
-def test_image_create_routes_reference_text_to_openai_edit(client, auth_headers):
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-            json={
-                "purpose": "이벤트",
-                "channels": ["인스타"],
-                "image_prompt": "참조 이미지를 활용해서 과일 가게 이벤트 이미지로 만들어줘",
-            "reference_images": [
-                {
-                    "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ax7Z3sAAAAASUVORK5CYII=",
-                    "mime_type": "image/png",
-                }
-            ],
-            "text_to_render": "오늘의 신선 과일",
-            "visual_mood": "bright",
-            "n": 1,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
+def test_image_create_routes_reference_text_to_openai_edit():
+    import asyncio
+
+    from app.schemas.image import ImageRequest
+    from app.services.image.create_service import create_image
+
+    result = asyncio.run(create_image(ImageRequest.model_validate({
+        "purpose": "이벤트",
+        "channels": ["인스타"],
+        "image_prompt": "참조 이미지를 활용해서 과일 가게 이벤트 이미지로 만들어줘",
+        "reference_images": [
+            {
+                "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ax7Z3sAAAAASUVORK5CYII=",
+                "mime_type": "image/png",
+            }
+        ],
+        "text_to_render": "오늘의 신선 과일",
+        "visual_mood": "bright",
+        "n": 1,
+    })))
+    data = result.model_dump()
     assert data["provider"] == "openai"
     assert data["routing"]["selected"]["model"] == "gpt-image-2"
     assert data["routing"]["selected"]["operation"] == "edit"
@@ -1507,6 +1753,130 @@ def test_image_create_warning_does_not_expose_raw_exception(monkeypatch):
     assert "unexpected provider failure" in warnings_text
 
 
+def test_image_create_auth_error_does_not_fallback(monkeypatch):
+    import asyncio
+
+    from app.core.exceptions import ProviderAuthenticationError
+    from app.schemas.image import ImageRequest
+    from app.services.image import create_service
+
+    async def fail_google_auth(request):
+        raise ProviderAuthenticationError("Google provider authentication failed.")
+
+    async def unexpected_openai_call(request):
+        raise AssertionError("OpenAI fallback should not run after provider auth failure")
+
+    monkeypatch.setattr(create_service, "generate_google_images", fail_google_auth)
+    monkeypatch.setattr(create_service, "generate_openai_images", unexpected_openai_call)
+
+    request = ImageRequest(
+        purpose="홍보",
+        channels=["인스타"],
+        image_prompt="카페 이미지",
+        visual_mood="bright",
+        n=1,
+    )
+
+    try:
+        asyncio.run(create_service.create_image(request))
+    except ProviderAuthenticationError:
+        pass
+    else:
+        raise AssertionError("Expected provider authentication failure to bypass fallback")
+
+
+def test_image_create_all_retryable_failures_use_placeholder_when_celery_retry_disabled(monkeypatch):
+    import asyncio
+
+    from app.core.exceptions import ProviderTimeoutError
+    from app.schemas.image import ImageRequest
+    from app.services.image import create_service
+
+    async def timeout_provider(request):
+        raise ProviderTimeoutError("provider timed out")
+
+    monkeypatch.setattr(create_service, "generate_google_images", timeout_provider)
+    monkeypatch.setattr(create_service, "generate_openai_images", timeout_provider)
+
+    request = ImageRequest(
+        purpose="홍보",
+        channels=["인스타"],
+        image_prompt="카페 이미지",
+        visual_mood="bright",
+        n=1,
+    )
+
+    result = asyncio.run(create_service.create_image(request))
+
+    assert result.provider == "local"
+    assert result.routing.fallback_used is True
+
+
+def test_image_create_all_retryable_failures_are_retried_when_retry_enabled(monkeypatch):
+    import asyncio
+
+    from app.config import get_settings
+    from app.core.exceptions import ProviderTimeoutError
+    from app.schemas.image import ImageRequest
+    from app.services.image import create_service
+
+    async def timeout_provider(request):
+        raise ProviderTimeoutError("provider timed out")
+
+    monkeypatch.setenv("CELERY_TASK_RETRY_ENABLED", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr(create_service, "generate_google_images", timeout_provider)
+    monkeypatch.setattr(create_service, "generate_openai_images", timeout_provider)
+
+    request = ImageRequest(
+        purpose="홍보",
+        channels=["인스타"],
+        image_prompt="카페 이미지",
+        visual_mood="bright",
+        n=1,
+    )
+
+    try:
+        asyncio.run(create_service.create_image(request))
+    except ProviderTimeoutError:
+        pass
+    else:
+        raise AssertionError("Expected retryable provider failure instead of local placeholder")
+
+
+def test_image_create_mixed_retryable_and_non_retryable_uses_placeholder_when_retry_enabled(monkeypatch):
+    import asyncio
+
+    from app.config import get_settings
+    from app.core.exceptions import ProviderRequestError, ProviderTimeoutError
+    from app.schemas.image import ImageRequest
+    from app.services.image import create_service
+
+    async def timeout_google(request):
+        raise ProviderTimeoutError("provider timed out")
+
+    async def reject_openai(request):
+        raise ProviderRequestError("provider rejected request")
+
+    monkeypatch.setenv("CELERY_TASK_RETRY_ENABLED", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr(create_service, "generate_google_images", timeout_google)
+    monkeypatch.setattr(create_service, "generate_openai_images", reject_openai)
+
+    request = ImageRequest(
+        purpose="홍보",
+        channels=["인스타"],
+        image_prompt="카페 이미지",
+        visual_mood="bright",
+        n=1,
+    )
+
+    result = asyncio.run(create_service.create_image(request))
+
+    assert result.provider == "local"
+    assert result.routing.fallback_used is True
+
+
 def test_image_job_failure_callback_uses_public_error(monkeypatch):
     from app.workers.tasks import image_tasks
 
@@ -1557,8 +1927,446 @@ def test_video_job_public_error_message_does_not_expose_raw_exception():
     assert "오류" in error or "외부 AI 서비스" in error
 
 
-def test_image_create_text_falls_back_to_nano_banana_when_openai_fails(client, auth_headers, monkeypatch):
+def test_retryable_provider_error_is_not_retried_by_default(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.core.exceptions import ProviderTimeoutError, RequestValidationError
+    from app.workers.tasks import image_tasks
+
+    task = SimpleNamespace(request=SimpleNamespace(retries=0), max_retries=2)
+    exhausted_task = SimpleNamespace(request=SimpleNamespace(retries=2), max_retries=2)
+
+    assert image_tasks._should_retry(task, ProviderTimeoutError("timeout")) is False
+    assert image_tasks._should_retry(exhausted_task, ProviderTimeoutError("timeout")) is False
+    assert image_tasks._should_retry(task, RequestValidationError("bad request")) is False
+
+
+def test_retryable_provider_error_is_marked_for_celery_retry_when_enabled(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.config import get_settings
+    from app.core.exceptions import ProviderTimeoutError, RequestValidationError
+    from app.workers.tasks import image_tasks
+
+    monkeypatch.setenv("CELERY_TASK_RETRY_ENABLED", "true")
+    get_settings.cache_clear()
+
+    task = SimpleNamespace(request=SimpleNamespace(retries=0), max_retries=2)
+    exhausted_task = SimpleNamespace(request=SimpleNamespace(retries=2), max_retries=2)
+
+    assert image_tasks._should_retry(task, ProviderTimeoutError("timeout")) is True
+    assert image_tasks._should_retry(exhausted_task, ProviderTimeoutError("timeout")) is False
+    assert image_tasks._should_retry(task, RequestValidationError("bad request")) is False
+
+
+def test_celery_delivery_settings_are_configured():
+    from app.workers.celery_app import celery_app
+
+    assert celery_app.conf.task_acks_late is True
+    assert celery_app.conf.task_reject_on_worker_lost is True
+    assert celery_app.conf.task_acks_on_failure_or_timeout is True
+
+
+def test_provider_time_limits_are_aligned_with_celery_limits():
+    from app.config import get_settings
+
+    settings = get_settings()
+
+    assert settings.video_max_wait_sec < settings.celery_task_soft_time_limit
+    assert settings.celery_task_soft_time_limit < settings.celery_task_time_limit
+    assert settings.celery_task_time_limit < settings.celery_broker_visibility_timeout
+
+
+def test_google_client_uses_configured_timeout(monkeypatch):
+    from app.config import get_settings
+    from app.services.image.google_service import _build_google_client
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.setenv("GOOGLE_PROVIDER_TIMEOUT_MS", "12345")
+    get_settings.cache_clear()
+
+    client = _build_google_client(get_settings(), "gemini-2.5-flash-image")
+
+    assert client._api_client._http_options.timeout == 12345
+
+
+def test_openai_image_client_uses_configured_timeout_and_closes(monkeypatch):
+    import asyncio
+    import sys
+    from types import SimpleNamespace
+
+    from app.config import get_settings
+    from app.schemas.image import ProviderImageRequest
+    from app.services.image.openai_service import generate_openai_images
+
+    captured = {"timeout": None, "closed": False}
+
+    class FakeImages:
+        async def generate(self, **kwargs):
+            return SimpleNamespace(data=[
+                SimpleNamespace(b64_json="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ax7Z3sAAAAASUVORK5CYII=")
+            ])
+
+    class FakeAsyncOpenAI:
+        def __init__(self, api_key, timeout):
+            captured["timeout"] = timeout
+            self.images = FakeImages()
+
+        async def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI))
+    monkeypatch.setenv("AI_PROVIDER_MODE", "live")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENAI_PROVIDER_TIMEOUT_SEC", "12.5")
+    get_settings.cache_clear()
+
+    result = asyncio.run(generate_openai_images(ProviderImageRequest(
+        prompt="timeout test",
+        model="gpt-image-1.5",
+        n=1,
+    )))
+
+    assert result.provider == "openai"
+    assert captured["timeout"] == 12.5
+    assert captured["closed"] is True
+
+
+def test_reference_image_download_uses_configured_timeout(monkeypatch):
+    from io import BytesIO
+
+    from app.config import get_settings
+    from app.services.image import references
+
+    captured = {"timeout": None}
+
+    class FakeResponse(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(url, timeout):
+        captured["timeout"] = timeout
+        return FakeResponse(b"image-bytes")
+
+    monkeypatch.setattr(references, "urlopen", fake_urlopen)
+    monkeypatch.setenv("REFERENCE_IMAGE_DOWNLOAD_TIMEOUT_SEC", "7.5")
+    get_settings.cache_clear()
+
+    payload = references._load_from_url("https://example.com/reference.png")
+
+    assert payload == b"image-bytes"
+    assert captured["timeout"] == 7.5
+
+
+def test_runway_requests_use_configured_timeouts(monkeypatch):
+    from io import BytesIO
+
+    from app.config import get_settings
+    from app.services.video import runway_service
+
+    captured = {"request_timeout": None, "download_timeout": None}
+
+    class FakeResponse(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(target, timeout):
+        if hasattr(target, "full_url"):
+            captured["request_timeout"] = timeout
+            return FakeResponse(b'{"id":"task-1"}')
+        captured["download_timeout"] = timeout
+        return FakeResponse(b"video-bytes")
+
+    monkeypatch.setattr(runway_service.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("RUNWAY_REQUEST_TIMEOUT_SEC", "8.5")
+    monkeypatch.setenv("RUNWAY_DOWNLOAD_TIMEOUT_SEC", "9.5")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+    response = runway_service._runway_json_request("POST", "https://runway.test/task", {}, settings)
+    video_bytes = runway_service._download_runway_output("https://runway.test/output.mp4")
+
+    assert response == {"id": "task-1"}
+    assert video_bytes == b"video-bytes"
+    assert captured["request_timeout"] == 8.5
+    assert captured["download_timeout"] == 9.5
+
+
+def test_worker_job_lock_duplicate_skips_run(monkeypatch):
+    from app.workers import job_locks
+
+    called = {"run": False}
+
+    def fail_if_called():
+        called["run"] = True
+        return {"status": "ran"}
+
+    monkeypatch.setattr(job_locks, "acquire_job_lock", lambda job_id, job_type: None)
+
+    result = job_locks.run_with_job_lock(
+        job_id="duplicate-job",
+        job_type="image",
+        on_duplicate=lambda: {"status": "duplicate_skipped"},
+        run=fail_if_called,
+    )
+
+    assert result == {"status": "duplicate_skipped"}
+    assert called["run"] is False
+
+
+def test_video_task_result_does_not_include_request_payload(monkeypatch):
+    from app.workers.tasks import video_tasks
+
+    async def fake_generation(job_id, request):
+        return {
+            "jobId": job_id,
+            "status": "completed",
+            "videoUrl": "http://testserver/generated/videos/result.mp4",
+            "callbacks": {},
+        }
+
+    monkeypatch.setattr(video_tasks, "_run_live_video_generation", fake_generation)
+
+    result = video_tasks._run_video_generation(
+        {
+            "jobId": "video-result-payload",
+            "prompt": "A small video",
+            "model": "fast",
+            "durationSeconds": 4,
+            "aspectRatio": "16:9",
+            "metadata": {"largeInput": "x" * 1000},
+        }
+    )
+
+    assert result["status"] == "completed"
+    assert "request" not in result
+
+
+def test_image_reference_base64_rejects_oversized_input(monkeypatch):
+    import base64
+
+    from app.config import get_settings
+    from app.core.exceptions import RequestValidationError
+    from app.schemas.image import ReferenceImage
+    from app.services.image.references import load_reference_image_bytes
+
+    monkeypatch.setenv("MAX_IMAGE_REFERENCE_BYTES", "4")
+    get_settings.cache_clear()
+
+    reference = ReferenceImage(
+        b64_json=base64.b64encode(b"12345").decode("ascii"),
+        mime_type="image/png",
+    )
+
+    try:
+        load_reference_image_bytes(reference)
+    except RequestValidationError as exc:
+        assert "Image reference exceeds" in exc.message
+    else:
+        raise AssertionError("Expected oversized image reference to fail")
+
+
+def test_image_reference_local_url_rejects_oversized_file(monkeypatch, tmp_path):
+    from app.config import get_settings
+    from app.core.exceptions import RequestValidationError
+    from app.schemas.image import ReferenceImage
+    from app.services.image.references import load_reference_image_bytes
+
+    image_path = tmp_path / "storage" / "images" / "large.png"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"12345")
+    monkeypatch.setenv("STORAGE_BASE_DIR", str(tmp_path / "storage"))
+    monkeypatch.setenv("STORAGE_PUBLIC_BASE_URL", "http://testserver/generated")
+    monkeypatch.setenv("MAX_IMAGE_REFERENCE_BYTES", "4")
+    get_settings.cache_clear()
+
+    reference = ReferenceImage(
+        image_url="http://testserver/generated/images/large.png",
+        mime_type="image/png",
+    )
+
+    try:
+        load_reference_image_bytes(reference)
+    except RequestValidationError as exc:
+        assert "Image reference exceeds" in exc.message
+    else:
+        raise AssertionError("Expected oversized local image reference to fail")
+
+
+def test_video_input_image_base64_rejects_oversized_input(monkeypatch):
+    import base64
+    from types import SimpleNamespace
+
+    from app.config import get_settings
+    from app.core.exceptions import RequestValidationError
+    from app.schemas.video import VideoShortMediaInput
+    from app.services.video.veo_service import _to_google_image
+
+    monkeypatch.setenv("MAX_VIDEO_INPUT_IMAGE_BYTES", "4")
+    get_settings.cache_clear()
+    media = VideoShortMediaInput(
+        bytesBase64Encoded=base64.b64encode(b"12345").decode("ascii"),
+        mimeType="image/png",
+    )
+    fake_types = SimpleNamespace(Image=lambda **kwargs: kwargs)
+
+    try:
+        _to_google_image(media, fake_types)
+    except RequestValidationError as exc:
+        assert "Video input image exceeds" in exc.message
+    else:
+        raise AssertionError("Expected oversized video input image to fail")
+
+
+def test_local_storage_cleanup_dry_run_keeps_files(tmp_path):
+    import os
+    import time
+
+    from app.storage.local_cleanup import cleanup_local_storage
+
+    old_file = tmp_path / "images" / "old.png"
+    recent_file = tmp_path / "videos" / "recent.mp4"
+    old_file.parent.mkdir(parents=True)
+    recent_file.parent.mkdir(parents=True)
+    old_file.write_bytes(b"old")
+    recent_file.write_bytes(b"recent")
+    now = time.time()
+    os.utime(old_file, (now - 10_000, now - 10_000))
+    os.utime(recent_file, (now, now))
+
+    result = cleanup_local_storage(
+        base_dir=tmp_path,
+        retention_seconds=3600,
+        dry_run=True,
+        now=now,
+    )
+
+    assert result.scanned_files == 2
+    assert result.delete_candidates == 1
+    assert result.deleted_files == 0
+    assert old_file.exists()
+    assert recent_file.exists()
+
+
+def test_local_storage_cleanup_deletes_old_files_and_empty_dirs(tmp_path):
+    import os
+    import time
+
+    from app.storage.local_cleanup import cleanup_local_storage
+
+    old_file = tmp_path / "images" / "nested" / "old.png"
+    recent_file = tmp_path / "videos" / "recent.mp4"
+    ignored_file = tmp_path / "manual.txt"
+    old_file.parent.mkdir(parents=True)
+    recent_file.parent.mkdir(parents=True)
+    old_file.write_bytes(b"old")
+    recent_file.write_bytes(b"recent")
+    ignored_file.write_bytes(b"ignored")
+    now = time.time()
+    os.utime(old_file, (now - 10_000, now - 10_000))
+    os.utime(recent_file, (now, now))
+    os.utime(ignored_file, (now - 10_000, now - 10_000))
+
+    result = cleanup_local_storage(
+        base_dir=tmp_path,
+        retention_seconds=3600,
+        dry_run=False,
+        now=now,
+    )
+
+    assert result.scanned_files == 2
+    assert result.delete_candidates == 1
+    assert result.deleted_files == 1
+    assert result.deleted_bytes == 3
+    assert result.removed_empty_dirs >= 1
+    assert not old_file.exists()
+    assert not old_file.parent.exists()
+    assert recent_file.exists()
+    assert ignored_file.exists()
+
+
+def test_async_stack_smoke_active_queue_names():
+    from tools.integration_async_stack_smoke import active_queue_names
+
+    queues = active_queue_names({
+        "worker-1": [{"name": "image-queue"}, {"name": "celery"}],
+        "worker-2": [{"name": "video-queue"}],
+    })
+
+    assert queues == {"image-queue", "video-queue", "celery"}
+
+
+def test_async_stack_smoke_result_payload_rejects_request_key():
+    from tools.integration_async_stack_smoke import validate_result_payload
+
+    check = validate_result_payload(
+        "video_short_job",
+        state="SUCCESS",
+        payload={"status": "failed", "request": {"bytesBase64Encoded": "large"}},
+        expected_status="failed",
+        disallow_keys={"request"},
+    )
+
+    assert check.status == "fail"
+    assert "forbidden keys" in check.detail
+
+
+def test_async_stack_smoke_result_payload_accepts_expected_status():
+    from tools.integration_async_stack_smoke import validate_result_payload
+
+    check = validate_result_payload(
+        "image_job",
+        state="SUCCESS",
+        payload={"status": "completed", "images": ["http://testserver/generated/images/result.png"]},
+        expected_status="completed",
+        disallow_keys=set(),
+    )
+
+    assert check.status == "ok"
+
+
+def test_async_stack_smoke_skipped_status_is_not_failure():
+    from tools.integration_async_stack_smoke import SmokeCheck, has_failure
+
+    checks = [
+        SmokeCheck("redis", "ok"),
+        SmokeCheck("redis_appendonly", "warn"),
+        SmokeCheck("provider_jobs", "skipped"),
+    ]
+
+    assert has_failure(checks) is False
+
+
+def test_async_stack_smoke_positive_int_helper():
+    from tools.integration_async_stack_smoke import _positive_int
+
+    assert _positive_int("536870912") is True
+    assert _positive_int("0") is False
+    assert _positive_int("512mb") is False
+
+
+def test_async_stack_smoke_reads_dotenv_value(monkeypatch, tmp_path):
+    import tools.integration_async_stack_smoke as smoke
+
+    env_file = tmp_path / ".env"
+    env_file.write_text('AI_PROVIDER_MODE="mock"\nREDIS_REQUIREPASS=secret\n', encoding="utf-8")
+    monkeypatch.setattr(smoke, "ENV_FILE", env_file)
+
+    assert smoke.read_dotenv_value("AI_PROVIDER_MODE") == "mock"
+    assert smoke.read_dotenv_value("MISSING") is None
+
+
+def test_image_create_text_falls_back_to_nano_banana_when_openai_fails(monkeypatch):
+    import asyncio
+
     from app.core.exceptions import ProviderError
+    from app.schemas.image import ImageRequest
     from app.services.image import create_service
 
     async def fail_openai(request):
@@ -1566,28 +2374,26 @@ def test_image_create_text_falls_back_to_nano_banana_when_openai_fails(client, a
 
     monkeypatch.setattr(create_service, "generate_openai_images", fail_openai)
 
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-            json={
-                "purpose": "홍보",
-                "channels": ["인스타"],
-                "image_prompt": "과일 가게 할인 행사 홍보 이미지",
-                "text_to_render": "오늘 딸기 30% 할인",
-                "visual_mood": "vibrant",
-                "n": 1,
-            },
-    )
-    assert response.status_code == 200
-    data = response.json()
+    result = asyncio.run(create_service.create_image(ImageRequest.model_validate({
+        "purpose": "홍보",
+        "channels": ["인스타"],
+        "image_prompt": "과일 가게 할인 행사 홍보 이미지",
+        "text_to_render": "오늘 딸기 30% 할인",
+        "visual_mood": "vibrant",
+        "n": 1,
+    })))
+    data = result.model_dump()
     assert data["provider"] == "google"
     assert data["routing"]["selected"]["model"] == "gemini-2.5-flash-image"
     assert data["routing"]["fallback_used"] is True
     assert "Korean text accuracy may be lower" in data["routing"]["warnings"][-1]
 
 
-def test_image_create_returns_placeholder_when_all_providers_fail(client, auth_headers, monkeypatch):
+def test_image_create_returns_placeholder_when_all_providers_fail(monkeypatch):
+    import asyncio
+
     from app.core.exceptions import ProviderError
+    from app.schemas.image import ImageRequest
     from app.services.image import create_service
 
     async def fail_provider(request):
@@ -1596,19 +2402,14 @@ def test_image_create_returns_placeholder_when_all_providers_fail(client, auth_h
     monkeypatch.setattr(create_service, "generate_google_images", fail_provider)
     monkeypatch.setattr(create_service, "generate_openai_images", fail_provider)
 
-    response = client.post(
-        "/v1/image/generate",
-        headers=auth_headers,
-            json={
-                "purpose": "홍보",
-                "channels": ["인스타"],
-                "image_prompt": "과일 가게 이미지",
-                "visual_mood": "warm_cozy",
-                "n": 2,
-            },
-    )
-    assert response.status_code == 200
-    data = response.json()
+    result = asyncio.run(create_service.create_image(ImageRequest.model_validate({
+        "purpose": "홍보",
+        "channels": ["인스타"],
+        "image_prompt": "과일 가게 이미지",
+        "visual_mood": "warm_cozy",
+        "n": 2,
+    })))
+    data = result.model_dump()
     assert data["provider"] == "local"
     assert data["model_used"] == "default-placeholder"
     assert data["routing"]["fallback_used"] is True

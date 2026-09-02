@@ -288,10 +288,10 @@ def _format_shortform_refine_rules(request: RefineTextRequest) -> str:
         "\n\n[숏폼 영상 재작성 기준]\n"
         f"- 선택 플랫폼/채널: {_shortform_platform_label(request)}\n"
         f"- 선택 화면 비율: {request.target.aspect_ratio or '제공되지 않음'}\n"
-        f"- 선택 길이: {request.target.duration_seconds or '제공되지 않음'}초\n"
-        "- 재작성 프롬프트 안에 선택 플랫폼, 화면 비율, 길이를 반영하세요.\n"
+        "- 영상 길이는 API의 구조화 파라미터로 전달되므로 재작성 프롬프트 본문에 초 단위 길이를 쓰지 마세요.\n"
+        "- 재작성 프롬프트 안에는 선택 플랫폼과 화면 비율만 반영하세요.\n"
         "- 선택값과 다른 길이, 비율, 채널을 만들거나 원문에서 유지하지 마세요.\n"
-        "- 원문이 선택값과 충돌하면 선택값에 맞게 고쳐 쓰세요.\n"
+        "- 원문이 선택값과 충돌하면 선택 플랫폼과 화면 비율에 맞게 고쳐 쓰고, 길이 표현은 제거하세요.\n"
         + visual_safety_guardrails()
     )
 
@@ -320,10 +320,7 @@ def _shortform_prompt_prefix(request: RefineTextRequest) -> str:
     if request.target.aspect_ratio:
         parts.append(f"{request.target.aspect_ratio} 세로형" if request.target.aspect_ratio == "9:16" else request.target.aspect_ratio)
     parts.append("숏폼 영상")
-    if request.target.duration_seconds:
-        parts.append(f"{request.target.duration_seconds}초 분량.")
-    else:
-        parts.append(".")
+    parts.append(".")
     return " ".join(parts).replace(" .", ".")
 
 
@@ -347,12 +344,17 @@ def _marketing_length_label(value: str) -> str:
 def _strip_conflicting_shortform_options(prompt: str) -> str:
     cleaned = prompt.strip()
     option_patterns = [
-        r"\b(?:YouTube\s+Shorts?|유튜브\s*쇼츠?|쇼츠|Shorts|Instagram\s+Reels?|인스타그램\s*릴스?|릴스|TikTok|틱톡|Naver\s+Clip|네이버\s*클립)\b",
+        r"(?:YouTube\s+Shorts?|유튜브\s*쇼츠?|쇼츠|Shorts|Instagram\s+Reels?|인스타그램\s*릴스?|릴스|TikTok|틱톡|Naver\s+Clip|네이버\s*클립)\s*용?",
         r"\b(?:\d{1,3})\s*(?:초|seconds?|sec)\s*(?:분량|길이|영상)?",
         r"\b(?:\d{1,3})-second\b\s*(?:video|short)?",
         r"\b(?:9\s*:\s*16|16\s*:\s*9|1\s*:\s*1|4\s*:\s*5)\b\s*(?:세로형|가로형|vertical|horizontal)?",
         r"(?:세로형|가로형)\s*(?:영상|숏폼)?",
         r"\b(?:vertical|horizontal)\s*(?:format|video)?\b",
+        r"(?:숏폼\s*영상|세로\s*영상|가로\s*영상)\s*[.。]?",
+        r"\b총\s*[.。]?",
+        r"(?:마지막(?:\s*에)?\s*)?[^.。!?]*(?:텍스트\s*오버레이|오버레이\s*텍스트|텍스트\s*배치|자막|캡션|문구|글자|글씨)[^.。!?]*[.。!?]?",
+        r"[^.。!?]*(?:text\s*overlay|overlay\s*text|subtitle|caption)[^.。!?]*[.。!?]?",
+        r"실존\s*인물[^.。!?]*(?:브랜드\s*로고|저작권\s*캐릭터)[^.。!?]*[.。!?]?",
     ]
     for pattern in option_patterns:
         cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)

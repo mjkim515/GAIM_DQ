@@ -6,10 +6,12 @@ from urllib import error, request
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+CALLBACK_MAX_ATTEMPTS = 3
+CALLBACK_RETRY_DELAY_SEC = 0.5
 
 
-async def notify_job_progress(job_id: str, progress: int) -> None:
-    await _post_callback(
+async def notify_job_progress(job_id: str, progress: int) -> bool:
+    return await _post_callback(
         f"/internal/callback/jobs/{job_id}/progress",
         {"progress": progress},
     )
@@ -23,7 +25,7 @@ async def notify_job_completed(
     model_used: str | None = None,
     fallback_used: bool | None = None,
     warnings: list[str] | None = None,
-) -> None:
+) -> bool:
     payload: dict[str, object] = {
         "status": "completed",
         "resultUrl": result_url,
@@ -37,7 +39,7 @@ async def notify_job_completed(
         payload["fallbackUsed"] = fallback_used
     if warnings is not None:
         payload["warnings"] = warnings
-    await _post_callback(f"/internal/callback/jobs/{job_id}", payload)
+    return await _post_callback(f"/internal/callback/jobs/{job_id}", payload)
 
 
 async def notify_image_job_completed(
@@ -46,8 +48,8 @@ async def notify_image_job_completed(
     provider: str,
     model_used: str,
     duration_ms: int,
-) -> None:
-    await _post_callback(
+) -> bool:
+    return await _post_callback(
         f"/internal/callback/jobs/{job_id}",
         {
             "status": "completed",
@@ -59,17 +61,17 @@ async def notify_image_job_completed(
     )
 
 
-async def notify_job_failed(job_id: str, error_message: str, duration_ms: int | None = None) -> None:
+async def notify_job_failed(job_id: str, error_message: str, duration_ms: int | None = None) -> bool:
     payload: dict[str, object] = {
         "status": "failed",
         "error": error_message,
     }
     if duration_ms is not None:
         payload["durationMs"] = duration_ms
-    await _post_callback(f"/internal/callback/jobs/{job_id}", payload)
+    return await _post_callback(f"/internal/callback/jobs/{job_id}", payload)
 
 
-async def _post_callback(path: str, payload: dict[str, object]) -> None:
+async def _post_callback(path: str, payload: dict[str, object]) -> bool:
     settings = get_settings()
     base_url = settings.was_base_url.rstrip("/")
     url = f"{base_url}{path}"
@@ -88,7 +90,14 @@ async def _post_callback(path: str, payload: dict[str, object]) -> None:
         with request.urlopen(callback_request, timeout=settings.was_callback_timeout_sec) as response:
             response.read()
 
-    try:
-        await asyncio.to_thread(send)
-    except (OSError, TimeoutError, error.URLError, error.HTTPError) as exc:
-        logger.warning("WAS callback failed for %s: %s", url, exc)
+    for attempt in range(1, CALLBACK_MAX_ATTEMPTS + 1):
+        try:
+            await asyncio.to_thread(send)
+            return True
+        except (OSError, TimeoutError, error.URLError, error.HTTPError) as exc:
+            if attempt >= CALLBACK_MAX_ATTEMPTS:
+                logger.warning("WAS callback failed for %s after %s attempts: %s", url, attempt, exc)
+                return False
+            logger.info("WAS callback retrying for %s attempt=%s error=%s", url, attempt, exc)
+            await asyncio.sleep(CALLBACK_RETRY_DELAY_SEC)
+    return False

@@ -6,28 +6,49 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REDIS_URL: ${DOCKER_REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${DOCKER_CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${DOCKER_CELERY_RESULT_BACKEND:-redis://redis:6379/1}
     ports:
-      - "8000:8000"
+      - "8002:8002"
     volumes:
       - ./app:/app/app
       - ./storage-data:/app/storage-data
     depends_on:
       - redis
 
-  worker:
+  image-worker:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
-      CELERY_WORKER_CONCURRENCY: 5
+      REDIS_URL: ${DOCKER_REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${DOCKER_CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${DOCKER_CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      CELERY_QUEUES: image-queue
+      CELERY_WORKER_CONCURRENCY: ${CELERY_IMAGE_WORKER_CONCURRENCY:-5}
+      CELERY_WORKER_NAME: ai-image-worker@%h
+    volumes:
+      - ./app:/app/app
+      - ./storage-data:/app/storage-data
+    depends_on:
+      - redis
+
+  video-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${DOCKER_REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${DOCKER_CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${DOCKER_CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      CELERY_QUEUES: video-queue
+      CELERY_WORKER_CONCURRENCY: ${CELERY_VIDEO_WORKER_CONCURRENCY:-1}
+      CELERY_WORKER_NAME: ai-video-worker@%h
     volumes:
       - ./app:/app/app
       - ./storage-data:/app/storage-data
@@ -36,5 +57,21 @@ services:
 
   redis:
     image: redis:7-alpine
+    command:
+      - sh
+      - -c
+      - >
+        redis-server
+        --appendonly "$${REDIS_APPENDONLY:-yes}"
+        --maxmemory "$${REDIS_MAXMEMORY:-512mb}"
+        --maxmemory-policy "$${REDIS_MAXMEMORY_POLICY:-noeviction}"
+        $${REDIS_REQUIREPASS:+--requirepass "$$REDIS_REQUIREPASS"}
+    env_file:
+      - .env
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  redis-data:

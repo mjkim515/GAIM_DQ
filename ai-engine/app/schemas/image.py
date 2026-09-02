@@ -3,6 +3,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.common import JobStatus
+
 IMAGE_SIZE_PATTERN = re.compile(r"^\d+x\d+$")
 IMAGE_ASPECT_RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9"}
 
@@ -101,6 +103,19 @@ class ImageJobResponse(BaseModel):
     job_id: str = Field(alias="jobId")
     status: str
     message: str
+
+
+class ImageStatusResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    job_id: str = Field(alias="jobId")
+    status: JobStatus
+    images: list[str] = Field(default_factory=list)
+    provider: str | None = None
+    model_used: str | None = Field(default=None, alias="modelUsed")
+    error: str | None = None
+    progress_pct: int | None = Field(default=None, alias="progressPct")
+    duration_ms: int | None = Field(default=None, alias="durationMs")
     
 
 class ProviderImageRequest(BaseModel):

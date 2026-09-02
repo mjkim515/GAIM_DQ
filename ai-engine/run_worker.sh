@@ -9,6 +9,7 @@ CELERY_APP="${CELERY_APP:-app.workers.celery_app.celery_app}"
 CELERY_QUEUES="${CELERY_QUEUES:-image-queue,video-queue}"
 CELERY_WORKER_CONCURRENCY="${CELERY_WORKER_CONCURRENCY:-3}"
 CELERY_LOGLEVEL="${CELERY_LOGLEVEL:-info}"
+CELERY_WORKER_NAME="${CELERY_WORKER_NAME:-}"
 
 if [[ ! -x "$CELERY_BIN" ]]; then
   echo "celery executable not found: $CELERY_BIN" >&2
@@ -20,8 +21,20 @@ echo "Starting ai-engine Celery worker"
 echo "  app        : $CELERY_APP"
 echo "  queues     : $CELERY_QUEUES"
 echo "  concurrency: $CELERY_WORKER_CONCURRENCY"
+if [[ -n "$CELERY_WORKER_NAME" ]]; then
+  echo "  worker name: $CELERY_WORKER_NAME"
+fi
 
-exec "$CELERY_BIN" -A "$CELERY_APP" worker \
-  --loglevel="$CELERY_LOGLEVEL" \
-  --concurrency="$CELERY_WORKER_CONCURRENCY" \
+WORKER_ARGS=(
+  -A "$CELERY_APP"
+  worker
+  --loglevel="$CELERY_LOGLEVEL"
+  --concurrency="$CELERY_WORKER_CONCURRENCY"
   -Q "$CELERY_QUEUES"
+)
+
+if [[ -n "$CELERY_WORKER_NAME" ]]; then
+  WORKER_ARGS+=(--hostname="$CELERY_WORKER_NAME")
+fi
+
+exec "$CELERY_BIN" "${WORKER_ARGS[@]}"

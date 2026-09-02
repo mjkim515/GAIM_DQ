@@ -89,6 +89,20 @@ def public_job_error_message(exc: Exception) -> str:
     return JOB_FAILURE_MESSAGES["generic"]
 
 
+def is_retryable_job_exception(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            ProviderRateLimitError,
+            ProviderTimeoutError,
+            ProviderConnectionError,
+            ProviderServiceUnavailableError,
+        ),
+    ):
+        return True
+    return bool(getattr(exc, "retryable", False))
+
+
 def provider_warning_message(exc: Exception) -> str:
     if isinstance(exc, ProviderAuthenticationError):
         return "provider authentication failed"

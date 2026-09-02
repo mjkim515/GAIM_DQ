@@ -63,14 +63,18 @@ async def _generate_openai_text(prompt: str, model: str, max_tokens: int, mock_r
     if not settings.openai_api_key:
         raise ProviderAuthenticationError("OpenAI provider authentication failed.")
 
+    client = None
     try:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_provider_timeout_sec)
         response = await client.chat.completions.create(**_build_chat_completion_kwargs(prompt, model, max_tokens))
     except Exception as exc:
         logger.exception("OpenAI text generation failed for model=%s", model)
         raise classify_openai_exception(exc) from exc
+    finally:
+        if client is not None:
+            await client.close()
 
     content = response.choices[0].message.content or ""
     usage = getattr(response, "usage", None)

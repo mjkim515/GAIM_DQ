@@ -122,6 +122,9 @@ def _edit_nano_banana_images_sync(request: ProviderImageGenerateWithReferenceReq
 
 def _build_google_client(settings, model: str | None = None, location: str | None = None):
     from google import genai
+    from google.genai import types
+
+    http_options = types.HttpOptions(timeout=settings.google_provider_timeout_ms)
 
     if settings.google_auth_mode == "vertex_ai":
         if not settings.has_google_service_account:
@@ -146,11 +149,12 @@ def _build_google_client(settings, model: str | None = None, location: str | Non
             project=settings.gcp_project_id,
             location=location or _resolve_vertex_location(settings, model),
             credentials=credentials,
+            http_options=http_options,
         )
 
     if not settings.google_api_key:
         raise ProviderAuthenticationError("Google provider authentication failed.")
-    return genai.Client(api_key=settings.google_api_key)
+    return genai.Client(api_key=settings.google_api_key, http_options=http_options)
 
 
 def _resolve_vertex_location(settings, model: str | None) -> str:
