@@ -40,7 +40,7 @@ def build_video_short_candidates(
             rank=2,
             provider="runway",
             model=runway_model,
-            reason="Runway is the fallback if Veo is unavailable or the request fails.",
+            reason="Runway is the fallback if Veo is unavailable, retired, or unsupported.",
         ),
     ]
     if provider_override is None:

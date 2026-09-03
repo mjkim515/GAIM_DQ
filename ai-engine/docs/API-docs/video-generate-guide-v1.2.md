@@ -10,7 +10,7 @@
 
 WAS 서버는 Google/Veo 모델명을 직접 전달하지 않습니다. `model`은 `fast`, `standard`, `lite` 중 하나만 전달하고, `ai-engine`이 내부에서 실제 provider 모델로 변환합니다.
 
-현재 기본 영상 provider는 Google Veo입니다. `ai-engine`은 Veo 후보를 먼저 실행하고, provider 실패 또는 지원 중단 등으로 실패하면 Runway 후보로 fallback합니다. 운영 WAS 요청에는 별도 provider 필드를 보내지 않습니다.
+현재 기본 영상 provider는 Google Veo입니다. `ai-engine`은 Veo 후보를 먼저 실행하고, Veo 모델 미지원/지원 중단/not found/provider unavailable 같은 즉시 오류일 때만 Runway 후보로 fallback합니다. Google long polling timeout이나 요청 validation 오류는 Runway로 이어서 실행하지 않고 실패로 처리합니다. 운영 WAS 요청에는 별도 provider 필드를 보내지 않습니다.
 
 영상 생성은 오래 걸릴 수 있으므로 Spring Boot WAS가 먼저 `jobId`를 생성하고 DB에 저장한 뒤, `ai-engine`에 `jobId`를 포함해 생성 요청을 전달합니다. `ai-engine`은 진행률, 완료, 실패를 WAS callback으로 알리고, frontend는 WAS 상태 API를 polling 합니다.
 
@@ -96,7 +96,7 @@ Frontend
   -> ai-engine POST /v1/video/jobs
   -> Celery video-queue
   -> app.workers.tasks.video_tasks.generate_video_short_task
-  -> provider 실행: Veo 우선, Runway fallback
+  -> provider 실행: Veo 우선, 즉시 비가용/모델 lifecycle 오류 시 Runway fallback
   -> storage 저장
   -> WAS callback progress/completed/failed
 ```
@@ -262,7 +262,7 @@ RUNWAY_API_VERSION=2024-11-06
 
 위 `GCP_*_LOCATION` 값은 Vertex AI 모델 호출 location입니다. 현재 생성 결과 저장소는 GCS가 아니라 로컬 `storage-data`입니다.
 
-Runway는 fallback provider입니다. 운영 기본 경로는 Google Veo이며, `RUNWAYML_API_SECRET`이 없으면 Veo 실패 후 Runway fallback도 인증 오류로 실패합니다.
+Runway는 fallback provider입니다. 운영 기본 경로는 Google Veo이며, `RUNWAYML_API_SECRET`이 없으면 Veo 즉시 비가용/모델 lifecycle 오류 후 Runway fallback도 인증 오류로 실패합니다.
 
 ## Celery worker 실행
 
@@ -315,7 +315,8 @@ Redis를 Docker로 직접 띄우는 기본 스크립트:
 - `POST /v1/video/jobs`가 요청을 검증하고 Celery task를 `video-queue`에 등록합니다.
 - Celery task는 `VideoShortCreateRequest`를 다시 검증합니다.
 - `AI_PROVIDER_MODE=mock`이면 실제 provider를 호출하지 않고 mock 실패 상태를 기록합니다.
-- `AI_PROVIDER_MODE=live`이면 Veo 후보를 먼저 실행하고, provider 실패 시 Runway 후보를 실행합니다.
+- `AI_PROVIDER_MODE=live`이면 Veo 후보를 먼저 실행하고, Veo 즉시 비가용/모델 lifecycle 오류 시 Runway 후보를 실행합니다.
+- Google long polling timeout이나 요청 validation 오류는 Runway fallback 없이 failed callback으로 종료합니다.
 - provider가 모두 실패하면 public-safe error message로 failed callback을 전송합니다.
 - Celery task 자체의 `max_retries=2`가 설정되어 있으나, 현재 provider fallback은 task 내부에서 순차 실행됩니다.
 - WAS callback이 source of truth를 갱신하고, frontend는 WAS 상태 API만 polling합니다.
@@ -347,7 +348,7 @@ ai-engine은 아래 책임만 수행합니다.
 - Celery video task 실행
 - WAS가 전달한 `jobId` 사용
 - `fast`, `standard`, `lite`를 실제 provider 후보로 변환
-- Veo 우선 provider 호출 및 Runway fallback
+- Veo 우선 provider 호출 및 즉시 비가용/모델 lifecycle 오류 시 Runway fallback
 - 생성 결과 storage 저장
 - WAS로 progress/completed/failed callback 전송
 
@@ -392,7 +393,7 @@ Runway fallback은 task에 따라 다릅니다.
 
 `gen4_turbo`는 Runway image-to-video 후보로만 사용합니다. Runway text-to-video 직접 테스트와 fallback은 `gen4.5`를 사용합니다.
 
-`providerOverride`가 없으면 Google/Veo를 먼저 실행하고 실패 시 Runway 후보로 fallback합니다. ai-engine Swagger에서 `providerOverride: "runway"`를 보내면 Veo를 건너뛰고 Runway 후보만 직접 테스트합니다. 이 필드는 backend DTO에 노출하지 않는 진단용 필드입니다.
+`providerOverride`가 없으면 Google/Veo를 먼저 실행하고, Veo 모델 미지원/지원 중단/not found/provider unavailable 같은 즉시 오류에서만 Runway 후보로 fallback합니다. Google long polling timeout이나 요청 validation 오류는 Runway로 이어 실행하지 않습니다. ai-engine Swagger에서 `providerOverride: "runway"`를 보내면 Veo를 건너뛰고 Runway 후보만 직접 테스트합니다. 이 필드는 backend DTO에 노출하지 않는 진단용 필드입니다.
 
 Runway API의 현재 video generation duration은 2~10초 범위이므로 WAS 계약의 `4`, `6`, `8`초를 그대로 전달합니다. `ai-engine`은 Runway payload 생성 시 2~10초 범위만 방어적으로 허용합니다.
 
@@ -672,7 +673,7 @@ Callback URL은 `ai-engine/.env`의 `WAS_BASE_URL` 기준으로 생성됩니다.
 ```env
 WAS_BASE_URL=http://localhost:8080
 WAS_INTERNAL_TOKEN=change-this-internal-token
-WAS_CALLBACK_TIMEOUT_SEC=1.0
+WAS_CALLBACK_TIMEOUT_SEC=5.0
 ```
 
 Docker Compose로 ai-engine을 실행하고 Spring Boot backend가 host에서 `8080`으로 실행 중이면, 컨테이너 내부의 `localhost`는 host가 아니므로 아래처럼 설정합니다.
@@ -700,7 +701,7 @@ X-Internal-Token: {WAS_INTERNAL_TOKEN}
 ai-engine/app/services/callbacks.py
 ```
 
-Callback 송신은 일시적인 backend 지연이나 네트워크 흔들림에 대비해 최대 3회 재시도합니다. 재시도는 provider 작업을 다시 실행하는 것이 아니라, 이미 계산된 progress/result payload를 backend WAS에 다시 전달하는 동작입니다. Spring Boot callback API는 같은 `jobId` callback이 중복 도착해도 같은 결과가 되도록 idempotent하게 처리해야 합니다.
+Callback 송신은 일시적인 backend 지연이나 네트워크 흔들림에 대비해 terminal callback 기준 최대 4회 재시도합니다. progress callback은 지연 누적을 막기 위해 1회만 시도합니다. 재시도는 provider 작업을 다시 실행하는 것이 아니라, 이미 계산된 progress/result payload를 backend WAS에 다시 전달하는 동작입니다. Spring Boot callback API는 같은 `jobId` callback이 중복 도착해도 같은 결과가 되도록 idempotent하게 처리해야 합니다.
 
 비디오 worker는 아래 순서로 callback을 보냅니다. `progress=5`, `progress=90`은 Veo/Runway provider가 제공하는 실제 진행률이 아니라 backend와 frontend가 상태 문구를 전환하기 위한 synthetic progress hint입니다.
 

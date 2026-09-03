@@ -4,7 +4,7 @@ import re
 import time
 
 from app.config import get_settings
-from app.core.exceptions import AIEngineError, RequestValidationError
+from app.core.exceptions import AIEngineError, ProviderTimeoutError, RequestValidationError
 from app.core.media_limits import decode_limited_base64
 from app.core.provider_errors import (
     classify_google_exception,
@@ -31,7 +31,7 @@ from app.services.video.model_router import (
 )
 from app.services.video.runway_service import generate_runway_video_short_sync
 from app.services.video.storage import store_video
-from app.services.job_status import celery_result_payload_for_job, remember_job_task
+from app.services.job_status import celery_result_payload_for_job, remember_job_task, record_terminal_status
 
 VIDEO_JOB_TTL_SECONDS = 12 * 60 * 60
 _JOBS: dict[str, VideoStatusResponse] = {}
@@ -288,6 +288,8 @@ def _video_task_result(
     result = status.model_dump(by_alias=True, mode="json")
     result["durationMs"] = duration_ms
     result["callbacks"] = callbacks
+    if status.status in {JobStatus.completed, JobStatus.failed}:
+        record_terminal_status("video", status.job_id, result)
     return result
 
 
@@ -427,8 +429,9 @@ def _video_visible_writing_policy() -> str:
     return (
         "[Visible writing policy]\n"
         "If visible words, signage, labels, menus, posters, banners, stickers, packaging text, subtitles, captions, "
-        "overlays, or UI-like marks naturally appear in the video, render them only as short, common English words. "
-        "Korean writing must not appear. Avoid pseudo-Korean or unreadable Korean-like glyphs."
+        "overlays, or UI-like marks naturally appear in the video, render them only as short, common English words "
+        "using English alphabet characters only. Non-English writing must not appear. Avoid Korean, Japanese, Chinese, "
+        "Arabic, pseudo-text, unreadable glyphs, and symbols that resemble writing."
     )
 
 
@@ -487,6 +490,8 @@ def _generate_video_short_with_fallback_sync(request: ResolvedVideoShortRequest)
             raise
         except Exception as exc:
             last_error = _normalize_video_provider_exception(exc) if candidate.provider == "google" else exc
+            if candidate.provider == "google" and not _should_fallback_from_google_video_error(last_error):
+                raise last_error
             if is_retryable_job_exception(last_error):
                 retryable_error = last_error
             logger.warning(
@@ -504,6 +509,12 @@ def _generate_video_short_with_fallback_sync(request: ResolvedVideoShortRequest)
     if last_error:
         raise last_error
     raise RuntimeError("No video provider candidates were available")
+
+
+def _should_fallback_from_google_video_error(exc: Exception) -> bool:
+    if isinstance(exc, (ProviderTimeoutError, TimeoutError)):
+        return False
+    return True
 
 
 def _generate_video_short_sync(request: ResolvedVideoShortRequest) -> bytes:

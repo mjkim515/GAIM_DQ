@@ -1,3 +1,5 @@
+import ipaddress
+import socket
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -61,9 +63,47 @@ def _load_from_url(image_url: str) -> bytes:
                     label="Image reference",
                 )
 
+    _validate_remote_reference_url(parsed)
     with urlopen(image_url, timeout=settings.reference_image_download_timeout_sec) as response:
         return read_limited_response(
             response,
             max_bytes=settings.max_image_reference_bytes,
             label="Image reference",
         )
+
+
+def _validate_remote_reference_url(parsed) -> None:
+    if parsed.scheme not in {"http", "https"}:
+        raise ProviderError("Reference image URL must use http or https.")
+    if not parsed.hostname:
+        raise ProviderError("Reference image URL must include a hostname.")
+
+    hostname = parsed.hostname
+    try:
+        _reject_private_address(ipaddress.ip_address(hostname))
+        return
+    except ValueError:
+        pass
+
+    try:
+        addresses = socket.getaddrinfo(hostname, parsed.port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ProviderError("Reference image URL hostname could not be resolved.") from exc
+
+    resolved_ips = {address[4][0] for address in addresses}
+    if not resolved_ips:
+        raise ProviderError("Reference image URL hostname could not be resolved.")
+    for resolved_ip in resolved_ips:
+        _reject_private_address(ipaddress.ip_address(resolved_ip))
+
+
+def _reject_private_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
+    if (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        raise ProviderError("Reference image URL points to a non-public network address.")

@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any
 
@@ -25,6 +26,42 @@ def remember_job_task(job_type: str, job_id: str, task_id: str | None) -> None:
         logger.warning("Could not persist %s job task mapping job_id=%s: %s", job_type, job_id, exc)
 
 
+def record_terminal_status(job_type: str, job_id: str | None, payload: dict[str, Any]) -> None:
+    if not job_id:
+        return
+    settings = get_settings()
+    try:
+        client = Redis.from_url(settings.redis_url)
+        client.set(
+            _terminal_key(job_type, job_id),
+            json.dumps(payload, ensure_ascii=False),
+            ex=settings.job_terminal_status_ttl_seconds,
+        )
+        client.close()
+    except Exception as exc:
+        logger.warning("Could not persist terminal %s job result job_id=%s: %s", job_type, job_id, exc)
+
+
+def get_terminal_status(job_type: str, job_id: str) -> dict[str, Any] | None:
+    try:
+        client = Redis.from_url(get_settings().redis_url, decode_responses=True)
+        raw_payload = client.get(_terminal_key(job_type, job_id))
+        client.close()
+    except Exception as exc:
+        logger.warning("Could not read terminal %s job result job_id=%s: %s", job_type, job_id, exc)
+        return None
+    if not isinstance(raw_payload, str) or not raw_payload:
+        return None
+    try:
+        parsed = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        logger.warning("Terminal %s job result was not valid JSON job_id=%s: %s", job_type, job_id, exc)
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
 def get_remembered_task_id(job_type: str, job_id: str) -> str | None:
     task_id = _MEMORY_TASK_IDS.get((job_type, job_id))
     if task_id:
@@ -43,6 +80,10 @@ def get_remembered_task_id(job_type: str, job_id: str) -> str | None:
 
 
 def celery_result_payload_for_job(job_type: str, job_id: str) -> dict[str, Any] | None:
+    terminal_payload = get_terminal_status(job_type, job_id)
+    if terminal_payload is not None:
+        return {"jobId": job_id, **terminal_payload}
+
     task_id = get_remembered_task_id(job_type, job_id)
     if not task_id:
         return None
@@ -51,7 +92,7 @@ def celery_result_payload_for_job(job_type: str, job_id: str) -> dict[str, Any] 
     result = AsyncResult(task_id, app=celery_app)
     state = result.state
     if state == "PENDING":
-        return {"jobId": job_id, "status": JobStatus.queued.value, "progressPct": 0}
+        return {"jobId": job_id, "status": JobStatus.processing.value, "progressPct": 5}
     if state in {"STARTED", "RETRY"}:
         return {"jobId": job_id, "status": JobStatus.processing.value, "progressPct": 5}
     if state == "SUCCESS":
@@ -66,3 +107,7 @@ def celery_result_payload_for_job(job_type: str, job_id: str) -> dict[str, Any] 
 
 def _task_key(job_type: str, job_id: str) -> str:
     return f"gaim:ai-engine:job-status:{job_type}:{job_id}"
+
+
+def _terminal_key(job_type: str, job_id: str) -> str:
+    return f"gaim:ai-engine:job-terminal:{job_type}:{job_id}"

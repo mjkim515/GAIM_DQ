@@ -10,7 +10,7 @@
 
 WAS 서버는 Google/Veo 모델명을 직접 전달하지 않습니다. `model`은 `fast`, `standard`, `lite` 중 하나만 전달하고, `ai-engine`이 내부에서 실제 provider 모델로 변환합니다.
 
-현재 기본 영상 provider는 Google Veo입니다. `ai-engine`은 Veo 후보를 먼저 실행하고, provider 실패 또는 지원 중단 등으로 실패하면 Runway 후보로 fallback합니다. 운영 WAS 요청에는 별도 provider 필드를 보내지 않습니다.
+현재 기본 영상 provider는 Google Veo입니다. `ai-engine`은 Veo 후보를 먼저 실행하고, Veo 모델 미지원/지원 중단/not found/provider unavailable 같은 즉시 오류일 때만 Runway 후보로 fallback합니다. Google long polling timeout이나 요청 validation 오류는 Runway로 이어서 실행하지 않고 실패로 처리합니다. 운영 WAS 요청에는 별도 provider 필드를 보내지 않습니다.
 
 영상 생성은 오래 걸릴 수 있으므로 Spring Boot WAS가 먼저 `jobId`를 생성하고 DB에 저장한 뒤, `ai-engine`에 `jobId`를 포함해 생성 요청을 전달합니다. `ai-engine`은 진행률, 완료, 실패를 WAS callback으로 알리고, frontend는 WAS 상태 API를 polling 합니다.
 
@@ -629,6 +629,102 @@ curl -X POST 'http://127.0.0.1:8002/v1/video/jobs' \
 ```
 
 WAS는 이미 저장한 `jobId`의 상태를 `pending`에서 `queued` 또는 `processing`으로 갱신하고, 이후 callback으로 상태를 업데이트합니다.
+
+## Callback 전달 계약
+
+`ai-engine`은 비디오 job 상태를 frontend에 직접 제공하지 않습니다. 운영 흐름에서 frontend status API의 source of truth는 backend WAS DB입니다. `ai-engine`은 provider 실행 중 발생한 진행률과 최종 결과를 Spring Boot WAS callback endpoint로 push합니다.
+
+Callback URL은 `ai-engine/.env`의 `WAS_BASE_URL` 기준으로 생성됩니다.
+
+```env
+WAS_BASE_URL=http://localhost:8080
+WAS_INTERNAL_TOKEN=change-this-internal-token
+WAS_CALLBACK_TIMEOUT_SEC=1.0
+```
+
+Callback endpoint:
+
+```http
+POST /internal/callback/jobs/{jobId}/progress
+POST /internal/callback/jobs/{jobId}
+```
+
+모든 callback에는 내부 토큰을 포함합니다.
+
+```http
+X-Internal-Token: {WAS_INTERNAL_TOKEN}
+```
+
+현재 callback 송신 구현:
+
+```text
+ai-engine/app/services/callbacks.py
+```
+
+비디오 worker는 아래 순서로 callback을 보냅니다.
+
+1. 작업 시작 직후 `progress=5`
+2. provider 생성 완료 후 `progress=90`
+3. storage 저장 완료 후 `completed`
+4. 예외 발생 시 `failed`
+
+Progress callback:
+
+```json
+{
+  "progress": 5
+}
+```
+
+Completed callback:
+
+```json
+{
+  "status": "completed",
+  "resultUrl": "http://127.0.0.1:8002/gaim/generated/videos/c2814445-0491-432a-ad99-268a6b3e7440.mp4",
+  "durationMs": 12345,
+  "provider": "google",
+  "modelUsed": "veo-3.1-fast-generate-001",
+  "fallbackUsed": false,
+  "warnings": []
+}
+```
+
+Spring Boot WAS는 `resultUrl`을 DB의 `videoUrl` 또는 결과 URL 컬럼에 저장하고, frontend 상태 응답에서는 `videoUrl`로 노출합니다.
+
+Failed callback:
+
+```json
+{
+  "status": "failed",
+  "error": "provider request failed",
+  "durationMs": 12345,
+  "warnings": [
+    "Rank 1 google/veo-3.1-fast-generate-001 failed: provider request failed",
+    "Rank 2 runway/gen4.5 failed: provider authentication failed"
+  ]
+}
+```
+
+Backend WAS 권장 상태 전이:
+
+| 시점 | WAS DB status | 설명 |
+|---|---|---|
+| WAS 생성 요청 수신 | `queued` 또는 `pending` | `jobId`, 사용자, 사업장, 요청 payload 저장 |
+| `/v1/video/jobs` queued 응답 | `queued` | ai-engine queue 등록 확인 |
+| progress callback | `processing` | `progressPct` 갱신 |
+| completed callback | `completed` | `resultUrl`, `provider`, `modelUsed`, `fallbackUsed`, `warnings`, `durationMs`, `progressPct=100` 저장 |
+| failed callback | `failed` | `error`, `warnings`, `durationMs`, `progressPct=100` 저장 |
+
+운영 주의사항:
+
+- `completed`, `failed`는 terminal status입니다.
+- terminal status 이후 늦게 도착한 progress callback은 무시합니다.
+- callback은 중복 도착할 수 있으므로 `jobId` 기준 idempotent하게 처리합니다.
+- `processing` 이후 `queued`로 되돌리는 상태 역전은 허용하지 않습니다.
+- callback이 유실될 수 있으므로 오래 `queued` 또는 `processing`에 머문 job은 backend scheduled reconciler가 ai-engine 상태 조회 API로 보정하는 fallback polling을 둘 수 있습니다.
+- `provider=runway` 또는 `fallbackUsed=true`면 Runway fallback 결과입니다. 현재 Runway fallback 영상은 별도 오디오 합성 없이 무음으로 취급합니다.
+- 상세 Spring Boot Controller/DTO 예시는 [Spring Boot 연동 가이드](./springboot-video-generate-guide-v1.1.md)를 기준으로 합니다.
 
 ## 상태 조회
 

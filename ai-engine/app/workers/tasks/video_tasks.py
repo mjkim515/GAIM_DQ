@@ -24,6 +24,7 @@ def generate_video_task(self, request_data: dict) -> dict:
         return run_with_job_lock(
             job_id=job_id,
             job_type="video",
+            task_id=getattr(self.request, "id", None),
             on_duplicate=lambda: _duplicate_result(job_id),
             run=lambda: _run_video_generation(request_data),
         )
@@ -40,6 +41,7 @@ def generate_video_short_task(self, request_data: dict) -> dict:
         return run_with_job_lock(
             job_id=job_id,
             job_type="video-short",
+            task_id=getattr(self.request, "id", None),
             on_duplicate=lambda: _duplicate_result(job_id),
             run=lambda: _run_video_short_generation(request_data),
         )

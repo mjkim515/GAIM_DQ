@@ -10,8 +10,13 @@ sys.path.insert(0, str(ROOT))
 
 os.environ["AI_PROVIDER_MODE"] = "mock"
 os.environ["WAS_INTERNAL_TOKEN"] = "test-token"
+os.environ["WAS_CALLBACK_TIMEOUT_SEC"] = "5.0"
 os.environ["STORAGE_PUBLIC_BASE_URL"] = "http://testserver/generated"
 os.environ["CELERY_TASK_ALWAYS_EAGER"] = "true"
+os.environ["CELERY_JOB_LOCK_ENABLED"] = "false"
+os.environ["REDIS_URL"] = "redis://localhost:6379/0"
+os.environ["CELERY_BROKER_URL"] = "redis://localhost:6379/0"
+os.environ["CELERY_RESULT_BACKEND"] = "redis://localhost:6379/1"
 
 from app.config import get_settings
 from app.main import app

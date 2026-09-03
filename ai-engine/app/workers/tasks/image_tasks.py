@@ -8,6 +8,7 @@ from app.core.provider_errors import is_retryable_job_exception, public_job_erro
 from app.schemas.image import ImageJobRequest, ImageRequest
 from app.services.callbacks import notify_image_job_completed, notify_job_failed, notify_job_progress
 from app.services.image.create_service import create_image
+from app.services.job_status import record_terminal_status
 from app.workers.celery_app import celery_app
 from app.workers.job_locks import run_with_job_lock
 
@@ -21,6 +22,7 @@ def generate_image_task(self, request_data: dict) -> dict:
         return run_with_job_lock(
             job_id=job_id,
             job_type="image",
+            task_id=getattr(self.request, "id", None),
             on_duplicate=lambda: _duplicate_result(job_id),
             run=lambda: _run_async(_run_image_job, request_data),
         )
@@ -48,16 +50,23 @@ async def _run_image_job(request_data: dict) -> dict:
             provider=result.provider,
             model_used=result.model_used,
             duration_ms=duration_ms,
+            fallback_used=result.routing.fallback_used,
+            warnings=result.routing.warnings,
         )
-        return {
+        payload = {
             "jobId": job_id,
             "status": "completed",
             "images": result.images,
             "provider": result.provider,
             "modelUsed": result.model_used,
             "durationMs": duration_ms,
+            "progressPct": 100,
+            "fallbackUsed": result.routing.fallback_used,
+            "warnings": result.routing.warnings,
             "callbacks": callback_results,
         }
+        record_terminal_status("image", job_id, payload)
+        return payload
     except Exception as exc:
         if get_settings().celery_task_retry_enabled and is_retryable_job_exception(exc):
             raise
@@ -75,13 +84,16 @@ async def _notify_image_task_failed(
     callback_sent = False
     if job_id:
         callback_sent = await notify_job_failed(job_id, public_error, duration_ms)
-    return {
+    payload = {
         "jobId": job_id,
         "status": "failed",
         "error": public_error,
         "durationMs": duration_ms,
+        "progressPct": 100,
         "callbacks": {"failed": callback_sent},
     }
+    record_terminal_status("image", job_id, payload)
+    return payload
 
 
 def _should_retry(task, exc: Exception) -> bool:

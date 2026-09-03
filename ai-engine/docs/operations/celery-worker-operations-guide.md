@@ -334,7 +334,7 @@ provider 장애를 실제로 완전히 재현하기는 어렵다. 운영 코드�
 | 요청 validation 오류 | 아니오 | 아니오 | 아니오 | 같은 요청을 반복해도 성공하지 않음 |
 | provider auth/config 오류 | 아니오 | 아니오 | 아니오 | 설정 오류를 fallback으로 숨기지 않음 |
 | rate limit | 예 | 예 | 기본 아니오, opt-in 시 fallback 모두 retryable 실패이면 예 | 일시 장애 가능성이 높음 |
-| timeout | 예 | 예 | 기본 아니오, opt-in 시 fallback 모두 retryable 실패이면 예 | worker slot 회수와 중복 provider 호출 위험을 함께 관리해야 함 |
+| timeout | 예 | 아니오 | 기본 아니오, opt-in 시 예 | 비디오는 long polling timeout 후 Runway를 이어 실행하지 않고 실패 처리해 task 시간 예산을 보호 |
 | connection 오류 | 예 | 예 | 기본 아니오, opt-in 시 fallback 모두 retryable 실패이면 예 | 네트워크 일시 장애 가능성 |
 | provider 5xx/service unavailable | 예 | 예 | 기본 아니오, opt-in 시 fallback 모두 retryable 실패이면 예 | provider 일시 장애 가능성 |
 | provider request rejected | 후보별 fallback 가능 | 후보별 fallback 가능 | 아니오 | 모델/요청 호환성 문제일 수 있어 후보 전환까지만 시도 |
@@ -350,10 +350,9 @@ provider 후보가 timeout/rate limit/connection/service unavailable 같은 retr
 placeholder 대신 retryable 오류를 worker로 올린다. retryable 오류와 non-retryable provider 오류가 섞이면 retry하지
 않고 fallback 결과를 사용한다. provider auth/config 오류는 fallback 없이 즉시 실패한다.
 
-비디오는 Google/Veo 실패 후 Runway fallback을 시도할 수 있다. `CELERY_TASK_RETRY_ENABLED=true`인 경우에는
-Google/Veo가 timeout/rate limit/connection 오류로 실패했고 Runway가 auth/config 오류로 실패한 상황에서도 앞선
-retryable 오류를 보존해 Celery retry 대상으로 유지한다. 기본값인 false에서는 마지막 실패를 기준으로 실패 callback을
-보낸다.
+비디오는 Google/Veo 모델 미지원, 지원 중단, not found, provider unavailable 같은 즉시 오류에서만 Runway fallback을
+시도한다. Google long polling timeout은 Runway로 이어 실행하지 않고 실패 처리한다. `CELERY_TASK_RETRY_ENABLED=true`인
+경우 timeout은 Celery retry 대상으로 보존될 수 있다. 기본값인 false에서는 실패 callback을 보낸다.
 
 ## Redis MVP 최소 정책
 

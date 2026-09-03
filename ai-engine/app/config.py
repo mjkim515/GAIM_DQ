@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     was_base_url: str = "http://localhost:8080"
     was_internal_token: str = "change-this-internal-token"
-    was_callback_timeout_sec: float = 1.0
+    was_callback_timeout_sec: float = 5.0
 
     ai_provider_mode: Literal["mock", "live"] = "mock"
     openai_api_key: str = ""
@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     celery_job_lock_ttl: int = 900
     celery_job_lock_enabled: bool = True
     job_status_ttl_seconds: int = 12 * 60 * 60
+    job_terminal_status_ttl_seconds: int = 24 * 60 * 60
     google_default_video_model: str = "veo-3.1-fast-generate-001"
     google_fast_video_model: str = "veo-3.1-fast-generate-001"
     google_standard_video_model: str = "veo-3.1-generate-001"
