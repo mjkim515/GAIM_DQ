@@ -1,6 +1,6 @@
 # 이미지 생성 API 가이드
 
-> Version: v1.2
+> Version: v1.1
 
 ## 요약
 
@@ -33,53 +33,11 @@ X-Internal-Token: {WAS_INTERNAL_TOKEN}
 Content-Type: application/json
 ```
 
-Callback 유실 보정용 ai-engine fallback 조회:
-
-```http
-GET /v1/image/status/{jobId}
-X-Internal-Token: {WAS_INTERNAL_TOKEN}
-```
-
-이 status API는 frontend 직접 호출용이 아닙니다. Spring Boot scheduled reconciler가 callback 유실을 보정할 때만
-사용합니다.
-
 Swagger:
 
 ```text
 http://127.0.0.1:8002/docs
 ```
-
-## 상태 동기화 원칙
-
-정상 경로는 ai-engine의 callback push입니다. ai-engine status API 조회는 callback push를 대체하지 않습니다.
-
-1. frontend는 Spring Boot의 `GET /api/ai/image/async/job/{jobId}`만 polling합니다.
-2. ai-engine worker는 `progress 5`, `progress 90`, `completed` 또는 `failed` callback을 Spring Boot로 push합니다.
-3. Spring Boot는 callback을 받아 WAS DB 상태를 갱신합니다.
-4. `GET /v1/image/status/{jobId}`는 Spring Boot scheduled reconciler만 사용하는 fallback 조회 API입니다.
-5. 사용자가 보는 운영 상태의 source of truth는 항상 Spring Boot/WAS DB입니다.
-
-```text
-정상 경로:
-ai-engine worker -> Spring Boot callback endpoint -> WAS DB -> frontend polling
-
-선택 보정 경로:
-Spring Boot scheduled reconciler -> ai-engine status API -> WAS DB 보정
-```
-
-| 경로/기능 | 필수 여부 | 목적 |
-|---|---:|---|
-| ai-engine callback push | 필수 | 정상 상태 업데이트 |
-| Spring Boot/WAS DB 상태 API | 필수 | frontend polling의 기준 상태 제공 |
-| Spring Boot scheduled reconciler | 선택 | callback 유실, WAS 재시작, 일시 timeout 시 상태 보정 |
-| ai-engine status API | 선택 | reconciler가 사용하는 fallback 조회 |
-
-최소 MVP는 callback push와 WAS DB 상태 API만으로 동작할 수 있습니다. 다만 callback이 유실되면 사용자가 계속
-`queued` 또는 `processing` 상태를 볼 수 있으므로, 안정화 MVP 또는 실제 운영에서는 scheduled reconciler를 추가하는
-것을 권장합니다.
-
-따라서 ai-engine status API를 frontend에 직접 노출하지 않습니다. callback 유실, WAS 재시작, 배포 중 callback
-endpoint timeout처럼 정상 callback push를 놓친 경우에만 reconciler fallback으로 사용합니다.
 
 ## 요청 필드
 
@@ -286,12 +244,6 @@ WAS_INTERNAL_TOKEN=change-this-internal-token
 WAS_CALLBACK_TIMEOUT_SEC=1.0
 ```
 
-Docker Compose로 ai-engine을 실행하고 Spring Boot backend가 host에서 `8080`으로 실행 중이면, 컨테이너 내부의 `localhost`는 host가 아니므로 아래처럼 설정합니다.
-
-```env
-WAS_BASE_URL=http://host.docker.internal:8080
-```
-
 Callback endpoint:
 
 ```http
@@ -311,12 +263,10 @@ X-Internal-Token: {WAS_INTERNAL_TOKEN}
 ai-engine/app/services/callbacks.py
 ```
 
-Callback 송신은 일시적인 backend 지연이나 네트워크 흔들림에 대비해 최대 3회 재시도합니다. 재시도는 provider 작업을 다시 실행하는 것이 아니라, 이미 계산된 progress/result payload를 backend WAS에 다시 전달하는 동작입니다. Spring Boot callback API는 같은 `jobId` callback이 중복 도착해도 같은 결과가 되도록 idempotent하게 처리해야 합니다.
+이미지 worker는 아래 순서로 callback을 보냅니다.
 
-이미지 worker는 아래 순서로 callback을 보냅니다. `progress=5`, `progress=90`은 OpenAI/Google provider가 제공하는 실제 진행률이 아니라 backend와 frontend가 상태 문구를 전환하기 위한 synthetic progress hint입니다.
-
-1. 작업 시작 직후 `progress=5` (`started`)
-2. provider 생성 완료 후 storage 저장 전 `progress=90` (`finalizing`)
+1. 작업 시작 직후 `progress=5`
+2. provider 생성 완료 후 `progress=90`
 3. storage 저장 완료 후 `completed`
 4. 예외 발생 시 `failed`
 
@@ -352,26 +302,6 @@ Failed callback:
 }
 ```
 
-Celery result backend에는 provider 작업 결과와 함께 callback 전송 성공 여부가 남습니다. 이 값은 운영 source of truth가 아니라 장애 분석용 관측 데이터입니다.
-
-```json
-{
-  "jobId": "f3325b10-bfcc-4ef3-814e-b1fcd47338fd",
-  "status": "completed",
-  "images": [
-    "http://127.0.0.1:8002/gaim/generated/images/358dd53d-6983-42b1-a949-f3dd71f25684.png"
-  ],
-  "provider": "google",
-  "modelUsed": "gemini-2.5-flash-image",
-  "durationMs": 12345,
-  "callbacks": {
-    "started": true,
-    "finalizing": true,
-    "completed": true
-  }
-}
-```
-
 Backend WAS 권장 상태 전이:
 
 | 시점 | WAS DB status | 설명 |
@@ -387,10 +317,9 @@ Backend WAS 권장 상태 전이:
 - `completed`, `failed`는 terminal status입니다.
 - terminal status 이후 늦게 도착한 progress callback은 무시합니다.
 - callback은 중복 도착할 수 있으므로 `jobId` 기준 idempotent하게 처리합니다.
-- ai-engine의 queued 응답이 늦게 도착해도 이미 `processing`, `completed`, `failed`로 진행된 DB 상태를 `queued`로 되돌리지 않습니다.
 - `processing` 이후 `queued`로 되돌리는 상태 역전은 허용하지 않습니다.
 - callback이 유실될 수 있으므로 오래 `queued` 또는 `processing`에 머문 job은 backend scheduled reconciler가 ai-engine 상태 조회 API로 보정하는 fallback polling을 둘 수 있습니다.
-- 상세 Spring Boot Controller/DTO 예시는 [Spring Boot 연동 가이드](./springboot-image-generate-guide-v1.2.md)를 기준으로 합니다.
+- 상세 Spring Boot Controller/DTO 예시는 [Spring Boot 연동 가이드](./springboot-image-generate-guide-v1.1.md)를 기준으로 합니다.
 
 ## Frontend 사용 흐름
 
@@ -408,6 +337,6 @@ Backend WAS 권장 상태 전이:
 
 ## 관련 문서
 
-- [모델 라우팅 정책](../internal-docs/image-routing-policy-v1.1.md)
-- [코드 실행 흐름](../internal-docs/image-code-flow-v1.1.md)
-- [Spring Boot 연동 가이드](./springboot-image-generate-guide-v1.2.md)
+- [모델 라우팅 정책](../../architecture/image-routing-policy.md)
+- [코드 실행 흐름](../../architecture/image-code-flow.md)
+- [Spring Boot 연동 가이드](./springboot-image-generate-guide-v1.1.md)

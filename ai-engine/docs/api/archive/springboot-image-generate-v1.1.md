@@ -163,6 +163,163 @@ public record ImageStatusResponse(
 
 라우팅 상세가 필요한 경우 ai-engine completed callback payload에 포함하도록 확장할 수 있지만, 현재 Spring Boot 상태 DTO의 기본 계약은 위 필드 중심입니다.
 
+## Callback 수신 API
+
+`ai-engine`은 이미지 생성 job의 진행률과 최종 결과를 Spring Boot callback API로 push합니다. Spring Boot는 이 API를 internal endpoint로 열어두고, 수신한 payload를 `jobId` 기준으로 DB에 반영합니다.
+
+```http
+POST /internal/callback/jobs/{jobId}/progress
+POST /internal/callback/jobs/{jobId}
+```
+
+모든 callback 요청에는 내부 토큰이 포함됩니다.
+
+```http
+X-Internal-Token: change-this-internal-token
+```
+
+Spring Boot의 `ai-engine.internal-token` 값과 `ai-engine/.env`의 `WAS_INTERNAL_TOKEN` 값은 반드시 같아야 합니다. `ai-engine`은 `WAS_BASE_URL`을 기준으로 callback URL을 생성합니다.
+
+```env
+WAS_BASE_URL=http://localhost:8080
+WAS_INTERNAL_TOKEN=change-this-internal-token
+WAS_CALLBACK_TIMEOUT_SEC=1.0
+```
+
+현재 `ai-engine` callback 송신 구현:
+
+```text
+ai-engine/app/services/callbacks.py
+```
+
+이미지 worker는 작업 시작 후 progress `5`, provider 생성 완료 후 progress `90`, 저장 완료 후 `completed` callback을 보냅니다. 실패하면 `failed` callback을 보냅니다.
+
+### Progress callback
+
+```json
+{
+  "progress": 5
+}
+```
+
+Spring Boot는 progress callback을 받으면 해당 job을 `processing`으로 전환하고 `progressPct`를 갱신합니다.
+
+```java
+public record ImageJobProgressRequest(
+        Integer progress
+) {
+}
+```
+
+### Completed callback
+
+```json
+{
+  "status": "completed",
+  "images": [
+    "http://127.0.0.1:8002/gaim/generated/images/358dd53d-6983-42b1-a949-f3dd71f25684.png"
+  ],
+  "provider": "google",
+  "modelUsed": "gemini-2.5-flash-image",
+  "durationMs": 12345
+}
+```
+
+### Failed callback
+
+```json
+{
+  "status": "failed",
+  "error": "provider request failed",
+  "durationMs": 12345
+}
+```
+
+```java
+import java.util.List;
+
+public record ImageJobCallbackRequest(
+        String status,
+        List<String> images,
+        String provider,
+        String modelUsed,
+        String error,
+        Long durationMs
+) {
+}
+```
+
+## Callback Controller 예시
+
+이미지와 비디오 callback endpoint는 같은 URL을 사용할 수 있습니다. Spring Boot는 `jobId`가 이미지 job인지 비디오 job인지 DB의 job type 또는 table로 구분해서 업데이트합니다.
+
+```java
+@RestController
+@RequestMapping("/internal/callback/jobs")
+public class AiJobCallbackController {
+
+    private final AiJobService aiJobService;
+    private final AiEngineProperties aiEngineProperties;
+
+    public AiJobCallbackController(
+            AiJobService aiJobService,
+            AiEngineProperties aiEngineProperties
+    ) {
+        this.aiJobService = aiJobService;
+        this.aiEngineProperties = aiEngineProperties;
+    }
+
+    @PostMapping("/{jobId}/progress")
+    public ResponseEntity<Void> updateProgress(
+            @PathVariable String jobId,
+            @RequestHeader("X-Internal-Token") String internalToken,
+            @RequestBody ImageJobProgressRequest request
+    ) {
+        if (!aiEngineProperties.internalToken().equals(internalToken)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+
+        aiJobService.updateImageProgress(jobId, request.progress());
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/{jobId}")
+    public ResponseEntity<Void> updateResult(
+            @PathVariable String jobId,
+            @RequestHeader("X-Internal-Token") String internalToken,
+            @RequestBody ImageJobCallbackRequest request
+    ) {
+        if (!aiEngineProperties.internalToken().equals(internalToken)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+
+        aiJobService.updateImageResult(jobId, request);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+## DB 상태 전이 규칙
+
+Spring Boot 운영 구현에서는 callback으로 받은 상태를 DB에 저장합니다. 현재 repo의 테스트 backend는 `ConcurrentHashMap` 기반 `ImageJobStore`를 사용하지만, 운영 backend에서는 같은 책임을 DB repository/service로 옮깁니다.
+
+| 시점 | DB status | 처리 |
+|---|---|---|
+| 생성 요청 수신 | `queued` 또는 `pending` | `jobId`, 사용자, 사업장, 요청 payload 저장 |
+| ai-engine queued 응답 수신 | `queued` | queue 등록 확인 시간 저장 |
+| progress callback 수신 | `processing` | `progressPct` 갱신 |
+| completed callback 수신 | `completed` | `images`, `provider`, `modelUsed`, `durationMs`, `progressPct=100` 저장 |
+| failed callback 수신 | `failed` | `error`, `durationMs`, `progressPct=100` 저장 |
+
+운영 규칙:
+
+- `completed`, `failed`는 terminal status입니다.
+- terminal status 이후 늦게 도착한 progress callback은 무시합니다.
+- 같은 completed/failed callback이 중복 도착해도 같은 결과가 되도록 idempotent하게 처리합니다.
+- `processing` 이후 `queued`로 되돌아가는 상태 역전은 허용하지 않습니다.
+- 알 수 없는 `jobId` callback은 404로 거절하거나 204 응답 후 보안 로그만 남기는 정책 중 하나로 통일합니다.
+- callback 유실에 대비해 오래 `queued` 또는 `processing`에 머문 job은 Spring Boot scheduled reconciler가 ai-engine status API로 보정하는 fallback polling을 둘 수 있습니다.
+
 ## ai-engine 내부 생성 결과
 
 worker 내부에서 provider 실행이 성공하면 ai-engine은 아래 형태의 생성 결과를 callback payload로 변환합니다.

@@ -9,10 +9,10 @@ storage-data/
 .DS_Store
 storage-data/
 
-# 다큐멘트
-docs/internal-docs/
-docs/API-docs/*.zip
-docs/발표자료
-docs/multiuser-async-docs/
-
-
+# docs - generated/shared artifacts not required with code
+docs/presentations/
+docs/releases/pdf/
+docs/logs/
+docs/archive/
+docs/planning/
+docs/assets/

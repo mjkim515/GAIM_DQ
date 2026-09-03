@@ -205,6 +205,181 @@ public record VideoStatusResponse(
 | `completed` | 생성 완료. `videoUrl` 사용 가능 |
 | `failed` | 실패. `error` 확인 필요 |
 
+## Callback 수신 API
+
+`ai-engine`은 비디오 생성 job의 진행률과 최종 결과를 Spring Boot callback API로 push합니다. Spring Boot는 이 API를 internal endpoint로 열어두고, 수신한 payload를 `jobId` 기준으로 DB에 반영합니다. 프론트엔드는 이 callback API를 직접 호출하지 않습니다.
+
+```http
+POST /internal/callback/jobs/{jobId}/progress
+POST /internal/callback/jobs/{jobId}
+```
+
+모든 callback 요청에는 내부 토큰이 포함됩니다.
+
+```http
+X-Internal-Token: change-this-internal-token
+```
+
+Spring Boot의 `ai-engine.internal-token` 값과 `ai-engine/.env`의 `WAS_INTERNAL_TOKEN` 값은 반드시 같아야 합니다. `ai-engine`은 `WAS_BASE_URL`을 기준으로 callback URL을 생성합니다.
+
+```env
+WAS_BASE_URL=http://localhost:8080
+WAS_INTERNAL_TOKEN=change-this-internal-token
+WAS_CALLBACK_TIMEOUT_SEC=1.0
+```
+
+현재 `ai-engine` callback 송신 구현:
+
+```text
+ai-engine/app/services/callbacks.py
+```
+
+비디오 worker는 작업 시작 후 progress `5`, provider 생성 완료 후 progress `90`, 저장 완료 후 `completed` callback을 보냅니다. 실패하면 `failed` callback을 보냅니다.
+
+### Progress callback
+
+```json
+{
+  "progress": 5
+}
+```
+
+Spring Boot는 progress callback을 받으면 해당 job을 `processing`으로 전환하고 `progressPct`를 갱신합니다.
+
+```java
+public record VideoJobProgressRequest(
+        Integer progress
+) {
+}
+```
+
+### Completed callback
+
+```json
+{
+  "status": "completed",
+  "resultUrl": "http://127.0.0.1:8002/gaim/generated/videos/c2814445-0491-432a-ad99-268a6b3e7440.mp4",
+  "durationMs": 12345,
+  "provider": "google",
+  "modelUsed": "veo-3.1-fast-generate-001",
+  "fallbackUsed": false,
+  "warnings": []
+}
+```
+
+Spring Boot는 `resultUrl`을 DB의 `videoUrl` 또는 결과 URL 컬럼에 저장해서 프론트엔드 상태 응답의 `videoUrl`로 반환합니다.
+
+### Failed callback
+
+```json
+{
+  "status": "failed",
+  "error": "provider request failed",
+  "durationMs": 12345
+}
+```
+
+Google/Veo가 실패하고 Runway fallback까지 실패한 경우 `warnings`가 함께 올 수 있습니다.
+
+```json
+{
+  "status": "failed",
+  "error": "provider request failed",
+  "durationMs": 12345,
+  "warnings": [
+    "Rank 1 google/veo-3.1-fast-generate-001 failed: provider request failed",
+    "Rank 2 runway/gen4.5 failed: provider authentication failed"
+  ]
+}
+```
+
+```java
+import java.util.List;
+
+public record VideoJobCallbackRequest(
+        String status,
+        String resultUrl,
+        String error,
+        Long durationMs,
+        String provider,
+        String modelUsed,
+        Boolean fallbackUsed,
+        List<String> warnings
+) {
+}
+```
+
+## Callback Controller 예시
+
+이미지와 비디오 callback endpoint는 같은 URL을 사용할 수 있습니다. Spring Boot는 `jobId`가 이미지 job인지 비디오 job인지 DB의 job type 또는 table로 구분해서 업데이트합니다.
+
+```java
+@RestController
+@RequestMapping("/internal/callback/jobs")
+public class AiJobCallbackController {
+
+    private final AiJobService aiJobService;
+    private final AiEngineProperties aiEngineProperties;
+
+    public AiJobCallbackController(
+            AiJobService aiJobService,
+            AiEngineProperties aiEngineProperties
+    ) {
+        this.aiJobService = aiJobService;
+        this.aiEngineProperties = aiEngineProperties;
+    }
+
+    @PostMapping("/{jobId}/progress")
+    public ResponseEntity<Void> updateProgress(
+            @PathVariable String jobId,
+            @RequestHeader("X-Internal-Token") String internalToken,
+            @RequestBody VideoJobProgressRequest request
+    ) {
+        if (!aiEngineProperties.internalToken().equals(internalToken)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+
+        aiJobService.updateVideoProgress(jobId, request.progress());
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/{jobId}")
+    public ResponseEntity<Void> updateResult(
+            @PathVariable String jobId,
+            @RequestHeader("X-Internal-Token") String internalToken,
+            @RequestBody VideoJobCallbackRequest request
+    ) {
+        if (!aiEngineProperties.internalToken().equals(internalToken)) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+
+        aiJobService.updateVideoResult(jobId, request);
+        return ResponseEntity.noContent().build();
+    }
+}
+```
+
+## DB 상태 전이 규칙
+
+Spring Boot 운영 구현에서는 callback으로 받은 상태를 DB에 저장합니다. 현재 repo의 테스트 backend는 `ConcurrentHashMap` 기반 `VideoJobStore`를 사용하지만, 운영 backend에서는 같은 책임을 DB repository/service로 옮깁니다.
+
+| 시점 | DB status | 처리 |
+|---|---|---|
+| 생성 요청 수신 | `queued` 또는 `pending` | `jobId`, 사용자, 사업장, 요청 payload 저장 |
+| ai-engine queued 응답 수신 | `queued` | queue 등록 확인 시간 저장 |
+| progress callback 수신 | `processing` | `progressPct` 갱신 |
+| completed callback 수신 | `completed` | `resultUrl`, `provider`, `modelUsed`, `fallbackUsed`, `warnings`, `durationMs`, `progressPct=100` 저장 |
+| failed callback 수신 | `failed` | `error`, `warnings`, `durationMs`, `progressPct=100` 저장 |
+
+운영 규칙:
+
+- `completed`, `failed`는 terminal status입니다.
+- terminal status 이후 늦게 도착한 progress callback은 무시합니다.
+- 같은 completed/failed callback이 중복 도착해도 같은 결과가 되도록 idempotent하게 처리합니다.
+- `processing` 이후 `queued`로 되돌아가는 상태 역전은 허용하지 않습니다.
+- 알 수 없는 `jobId` callback은 404로 거절하거나 204 응답 후 보안 로그만 남기는 정책 중 하나로 통일합니다.
+- callback 유실에 대비해 오래 `queued` 또는 `processing`에 머문 job은 Spring Boot scheduled reconciler가 ai-engine status API로 보정하는 fallback polling을 둘 수 있습니다.
+
 ## WebClient 호출
 
 ```java
